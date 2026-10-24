@@ -5,6 +5,9 @@ on:
   push:
     tags: ['launcher-v*']
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
