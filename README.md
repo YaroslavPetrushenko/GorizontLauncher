@@ -97,6 +97,14 @@ AuthMe Reloaded остаётся серверной системой автор�
 
 Скрипт добавляет в корень ZIP правильный `manifest.json` с Minecraft 1.21.1 и NeoForge 248. Затем создай GitHub Release с тегом `pack-1.0.0` и прикрепи получившийся `modpack.zip`.
 
+Для профиля из другого лаунчера, где версия называется `Create(VOID)`, используй:
+
+```powershell
+.\tools\Build-ClientPack.ps1 -Profile "C:\Users\petry\AppData\Roaming\.minecraft\versions\Create(VOID)" -BaseModsZip "C:\Users\petry\Downloads\sborka-2.0.zip" -Output "modpack.zip"
+```
+
+Этот вариант добавляет к модам конфиги, ресурсы, schematics и файлы `Create(VOID).jar`/`.json`.
+
 ## Запуск разработки
 
 ```powershell
