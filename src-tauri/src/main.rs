@@ -203,6 +203,14 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
         }
     }
     if latest == local_version.trim_start_matches('v') && marker.exists() { return Ok(latest); }
+    // A manually pre-installed client profile is also a valid installation. Do not overwrite it
+    // with a 236 MB download merely because this launcher has not written its marker yet.
+    let profile_dir = target.join("versions").join(&config.launch_version_id);
+    if profile_dir.join(format!("{}.jar", config.launch_version_id)).exists() && profile_dir.join(format!("{}.json", config.launch_version_id)).exists() {
+        let installed = PackManifest { schema_version: 1, pack_id: config.pack_id.clone(), pack_version: latest.clone(), minecraft_version: config.minecraft_version.clone(), loader: LoaderManifest { r#type: config.loader_type.clone(), version: config.loader_version.clone() } };
+        fs::write(&marker, serde_json::to_vec_pretty(&installed).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        return Ok(latest);
+    }
     let asset = release.assets.iter().find(|a| a.name == config.modpack_asset).ok_or_else(|| format!("В релизе нет файла {}", config.modpack_asset))?;
     download_and_extract_modpack(app, asset.browser_download_url.clone(), target_dir, None).await?;
     Ok(latest)
