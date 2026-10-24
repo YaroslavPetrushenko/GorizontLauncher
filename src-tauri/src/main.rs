@@ -59,9 +59,16 @@ struct VersionProfile {
 struct LaunchArguments { jvm: Option<Vec<serde_json::Value>>, game: Option<Vec<serde_json::Value>> }
 
 fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)]) -> Vec<String> {
-    values.iter().filter_map(|value| value.as_str()).map(|value| {
-        replacements.iter().fold(value.to_string(), |text, (key, replacement)| text.replace(key, replacement))
-    }).collect()
+    values.iter().flat_map(|value| {
+        if let Some(text) = value.as_str() { return vec![text.to_string()]; }
+        // Ignore arguments explicitly restricted to another operating system (for example macOS-only JVM flags).
+        if let Some(rules) = value.get("rules").and_then(|rules| rules.as_array()) {
+            let allowed_for_windows = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name == "windows").unwrap_or(true));
+            let restricted_elsewhere = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name != "windows").unwrap_or(false));
+            if restricted_elsewhere && !allowed_for_windows { return Vec::new(); }
+        }
+        value.get("values").and_then(|items| items.as_array()).map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    }).map(|value| replacements.iter().fold(value, |text, (key, replacement)| text.replace(key, replacement))).collect()
 }
 
 #[derive(Deserialize)]
@@ -82,6 +89,13 @@ fn launcher_config() -> Result<LauncherConfig, String> {
 
 fn releases_api_url(config: &LauncherConfig) -> String {
     format!("https://api.github.com/repos/{}/{}/releases?per_page=30", config.github_owner, config.github_repo)
+}
+
+fn version_newer(candidate: &str, current: &str) -> bool {
+    let parse = |version: &str| version.split('.').map(|part| part.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+    let candidate = parse(candidate); let current = parse(current);
+    for index in 0..candidate.len().max(current.len()) { let left = *candidate.get(index).unwrap_or(&0); let right = *current.get(index).unwrap_or(&0); if left != right { return left > right; } }
+    false
 }
 
 #[derive(Clone, Serialize)] struct DownloadProgress { downloaded: u64, total: Option<u64>, percent: f32, stage: String }
@@ -144,7 +158,7 @@ async fn check_launcher_update() -> Result<Option<LauncherUpdate>, String> {
     let config = launcher_config()?;
     let releases: Vec<serde_json::Value> = reqwest::Client::new().get(releases_api_url(&config)).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
     let current = env!("CARGO_PKG_VERSION");
-    for release in releases { let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default(); if !tag.starts_with("launcher-v") { continue; } let version = tag.trim_start_matches("launcher-v"); if version <= current { continue; } if let Some(asset) = release.get("assets").and_then(|v| v.as_array()).and_then(|assets| assets.iter().find(|a| a.get("name").and_then(|v| v.as_str()).map(|n| n.ends_with("-setup.exe")).unwrap_or(false))) { return Ok(Some(LauncherUpdate { version: version.into(), url: asset.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or_default().into(), size: asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0) })); } }
+    for release in releases { let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default(); if !tag.starts_with("launcher-v") { continue; } let version = tag.trim_start_matches("launcher-v"); if !version_newer(version, current) { continue; } if let Some(asset) = release.get("assets").and_then(|v| v.as_array()).and_then(|assets| assets.iter().find(|a| a.get("name").and_then(|v| v.as_str()).map(|n| n.ends_with("-setup.exe")).unwrap_or(false))) { return Ok(Some(LauncherUpdate { version: version.into(), url: asset.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or_default().into(), size: asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0) })); } }
     Ok(None)
 }
 
@@ -153,8 +167,9 @@ async fn download_launcher_update(app: AppHandle, url: String) -> Result<(), Str
     let response = reqwest::Client::new().get(&url).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
     let total = response.content_length(); let mut downloaded = 0; let mut bytes = Vec::new(); let mut stream = response.bytes_stream(); emit_progress(&app, "Скачиваем обновление лаунчера...", 0, total);
     while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(&app, "Скачиваем обновление лаунчера...", downloaded, total); }
-    let path = env::temp_dir().join("GorizontLauncher-update.exe"); fs::write(&path, bytes).map_err(|e| e.to_string())?; emit_progress(&app, "Запускаем установщик...", 1, Some(1));
-    Command::new(&path).spawn().map_err(|e| format!("Не удалось запустить установщик: {e}"))?; app.exit(0); Ok(())
+    let path = launcher_data_dir()?.join("GorizontLauncher-update.exe"); fs::write(&path, bytes).map_err(|e| e.to_string())?; emit_progress(&app, "Устанавливаем обновление поверх текущей версии...", 1, Some(1));
+    // NSIS updates the existing installation in place; it is never an uninstall action.
+    Command::new(&path).arg("/S").spawn().map_err(|e| format!("Не удалось запустить установщик: {e}"))?; app.exit(0); Ok(())
 }
 
 #[tauri::command]
@@ -184,7 +199,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     let marker = target.join(".gorizont-installed.json");
     if let Ok(text) = fs::read_to_string(&marker) {
         if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
-            if validate_manifest(&installed, &config).is_ok() && installed.pack_version == latest { return Ok(latest); }
+            if validate_manifest(&installed, &config).is_ok() { return Ok(installed.pack_version); }
         }
     }
     if latest == local_version.trim_start_matches('v') && marker.exists() { return Ok(latest); }
@@ -205,10 +220,13 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
     let libraries = profile.libraries.unwrap_or_default().into_iter().filter_map(|library| library.artifact.map(|a| game_path.join(a.path))).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
     let classpath = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).collect::<Vec<_>>().join(";");
-    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "0".into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())];
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", config.minecraft_version.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())];
+    let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
     let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{ram}M")];
-    if let Some(profile_args) = profile.arguments { if let Some(jvm) = profile_args.jvm { args.extend(profile_values(&jvm.iter().flat_map(|v| v.get("values").into_iter().flat_map(|x| x.as_array().into_iter().flatten().cloned())).collect::<Vec<_>>(), &replacements)); } }
-    args.extend(["-cp".into(), classpath, profile.main_class.unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into()), "--username".into(), username, "--version".into(), version_id, "--gameDir".into(), game_path.to_string_lossy().to_string(), "--server".into(), config.server_address, "--port".into(), config.server_port.to_string()]);
+    if let Some(jvm) = jvm { args.extend(profile_values(&jvm, &replacements)); }
+    args.extend(["-cp".into(), classpath, profile.main_class.unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into())]);
+    if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
+    args.extend(["--server".into(), config.server_address, "--port".into(), config.server_port.to_string()]);
     Command::new(java).args(args).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
 }
 
