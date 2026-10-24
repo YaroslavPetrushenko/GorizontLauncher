@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - run: npm install
+      - run: npm ci --no-audit --no-fund
       - run: npm run tauri build
       - name: Publish Windows installer
         uses: softprops/action-gh-release@v2
