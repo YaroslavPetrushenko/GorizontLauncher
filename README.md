@@ -23,13 +23,25 @@ git push origin launcher-v1.0.0
 
 ### Как менять только сборку
 
-1. В GitHub откройте **Releases** → **Create a new release**.
-2. Создайте обычный тег сборки, например `pack-1.0.1`.
-3. Прикрепите ZIP-файл строго с именем `modpack.zip`.
-4. Нажмите **Publish release**.
-5. Новый установленный лаунчер сам скачает сборку при следующем запуске игры.
+1. Подготовьте папку сборки: моды, конфиги и `manifest.json`.
+2. `manifest.json` должен лежать в корне ZIP и иметь формат из [modpack-manifest.example.json](E:\GorizontLauncher\modpack-manifest.example.json):
 
-Новый лаунчер для этого не требуется.
+```json
+{
+  "schema_version": 1,
+  "pack_id": "gorizont",
+  "pack_version": "1.0.1",
+  "minecraft_version": "1.21.1",
+  "loader": { "type": "neoforge", "version": "248" }
+}
+```
+
+3. Упакуйте содержимое папки в файл строго `modpack.zip`.
+4. В GitHub откройте **Releases** → **Create a new release**.
+5. Создайте тег сборки, например `pack-1.0.1`, прикрепите `modpack.zip` и нажмите **Publish release**.
+6. Установленный лаунчер сам скачает ZIP, проверит `manifest.json`, версию Minecraft и NeoForge, а затем установит сборку.
+
+Новый лаунчер игроку для этого не требуется. Если manifest отсутствует или версия загрузчика отличается от настроенной, установка остановится с понятной ошибкой.
 
 Имя файла и репозиторий можно изменить в одном файле в корне проекта:
 
@@ -39,12 +51,17 @@ git push origin launcher-v1.0.0
   "github_owner": "YaroslavPetrushenko",
   "github_repo": "GorizontLauncher",
   "modpack_asset": "modpack.zip",
+  "expected_manifest": "manifest.json",
+  "pack_id": "gorizont",
   "release_mode": "modpack-only",
-  "minecraft_version": "1.21.1-neoforge"
+  "minecraft_version": "1.21.1",
+  "launch_version_id": "1.21.1-neoforge",
+  "loader_type": "neoforge",
+  "loader_version": "248"
 }
 ```
 
-После изменения `launcher.config.json` нужно заново собрать лаунчер, потому что конфигурация встраивается в Rust-приложение при компиляции.
+После изменения `launcher.config.json` нужно заново собрать лаунчер, потому что конфигурация встраивается в Rust-приложение при компиляции. Игроку достаточно скачать Windows-установщик один раз; обычные обновления pack-релизов скачиваются автоматически.
 
 Если точного `modpack.zip` нет, лаунчер покажет ошибку и не будет скачивать исходный код репозитория. Это важно: ZIP самого лаунчера и ZIP сборки — разные файлы.
 

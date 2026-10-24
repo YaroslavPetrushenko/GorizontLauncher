@@ -2,6 +2,11 @@
   "github_owner": "YaroslavPetrushenko",
   "github_repo": "GorizontLauncher",
   "modpack_asset": "modpack.zip",
+  "expected_manifest": "manifest.json",
+  "pack_id": "gorizont",
   "release_mode": "modpack-only",
-  "minecraft_version": "1.21.1-neoforge"
+  "minecraft_version": "1.21.1",
+  "launch_version_id": "1.21.1-neoforge",
+  "loader_type": "neoforge",
+  "loader_version": "248"
 }
