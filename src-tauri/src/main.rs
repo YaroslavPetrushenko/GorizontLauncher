@@ -25,7 +25,7 @@ struct LauncherConfig {
     loader_version: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct PackManifest {
     schema_version: u32,
     pack_id: String,
@@ -34,7 +34,7 @@ struct PackManifest {
     loader: LoaderManifest,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct LoaderManifest {
     r#type: String,
     version: String,
