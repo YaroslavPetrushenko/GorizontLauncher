@@ -4,13 +4,25 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, io::{self, Read}, path::{Path, PathBuf}, process::Command};
+use std::{env, fs, io::{self, Read}, path::{Path, PathBuf}, process::Command};
 use tauri::{AppHandle, Emitter};
 use zip::ZipArchive;
 
 const VERSION_ID: &str = "1.21.1-neoforge";
 const WEBHOOK_URL: &str = "";
 const WEBHOOK_TOKEN: &str = "";
+const JAVA_DOWNLOAD_URL: &str = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
+
+fn expand_windows_path(input: &str) -> PathBuf {
+    let mut value = input.to_string();
+    if value.contains("%APPDATA%") { if let Ok(app_data) = env::var("APPDATA") { value = value.replace("%APPDATA%", &app_data); } }
+    PathBuf::from(value.replace('/', "\\"))
+}
+
+fn launcher_data_dir() -> Result<PathBuf, String> {
+    let base = env::var("LOCALAPPDATA").map_err(|_| "Не удалось определить LOCALAPPDATA".to_string())?;
+    let path = PathBuf::from(base).join("GorizontLauncher"); fs::create_dir_all(&path).map_err(|e| e.to_string())?; Ok(path)
+}
 
 #[derive(Deserialize)]
 struct LauncherConfig {
@@ -90,7 +102,7 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
 
 #[tauri::command]
 async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: String, expected_sha256: Option<String>) -> Result<(), String> {
-    let target = PathBuf::from(&target_dir); fs::create_dir_all(&target).map_err(|e| e.to_string())?; let config = launcher_config()?;
+    let target = expand_windows_path(&target_dir); fs::create_dir_all(&target).map_err(|e| e.to_string())?; let config = launcher_config()?;
     let response = reqwest::Client::new().get(&url).header("User-Agent", "GorizontLauncher/0.1").send().await.map_err(|e| e.to_string())?;
     let total = response.content_length(); let mut downloaded = 0; let mut bytes = Vec::new(); let mut stream = response.bytes_stream();
     emit_progress(&app, "Скачивание модов...", 0, total);
@@ -100,6 +112,20 @@ async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: S
     let cursor = io::Cursor::new(bytes); let mut archive = ZipArchive::new(cursor).map_err(|e| e.to_string())?; let manifest = safe_extract(&mut archive, &target, &config)?;
     fs::write(target.join(".gorizont-installed.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     emit_progress(&app, "Готово", 1, Some(1)); Ok(())
+}
+
+#[tauri::command]
+async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(java_home) = env::var("JAVA_HOME") { let candidate = PathBuf::from(java_home).join("bin").join("javaw.exe"); if candidate.exists() { return Ok(candidate); } }
+    if let Ok(path) = env::var("PATH") { for folder in path.split(';') { let candidate = PathBuf::from(folder).join("javaw.exe"); if candidate.exists() { return Ok(candidate); } } }
+    let root = launcher_data_dir()?.join("runtime"); let java = root.join("bin").join("javaw.exe"); if java.exists() { return Ok(java); }
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?; emit_progress(app, "Скачиваем Java 21...", 0, None);
+    let response = reqwest::Client::new().get(JAVA_DOWNLOAD_URL).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| format!("Не удалось скачать Java 21: {e}"))?; let total = response.content_length(); let mut bytes = Vec::new(); let mut downloaded = 0; let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(app, "Скачиваем Java 21...", downloaded, total); }
+    let archive_path = launcher_data_dir()?.join("java.zip"); fs::write(&archive_path, bytes).map_err(|e| e.to_string())?; emit_progress(app, "Распаковываем Java 21...", 0, None);
+    let file = fs::File::open(&archive_path).map_err(|e| e.to_string())?; let mut archive = ZipArchive::new(file).map_err(|e| format!("Архив Java повреждён: {e}"))?; let temp = launcher_data_dir()?.join("runtime-new"); if temp.exists() { fs::remove_dir_all(&temp).map_err(|e| e.to_string())?; } fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
+    for i in 0..archive.len() { let mut entry = archive.by_index(i).map_err(|e| e.to_string())?; let name = entry.enclosed_name().ok_or_else(|| "Небезопасный путь в архиве Java".to_string())?.to_owned(); let out = temp.join(name); if entry.is_dir() { fs::create_dir_all(out).map_err(|e| e.to_string())?; } else { if let Some(parent) = out.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; } let mut output = fs::File::create(out).map_err(|e| e.to_string())?; io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?; } }
+    let java_candidate = fs::read_dir(&temp).map_err(|e| e.to_string())?.filter_map(Result::ok).map(|e| e.path().join("bin").join("javaw.exe")).find(|p| p.exists()).ok_or_else(|| "В скачанном архиве Java не найден javaw.exe".to_string())?; if root.exists() { fs::remove_dir_all(&root).map_err(|e| e.to_string())?; } fs::rename(&temp, &root).map_err(|e| e.to_string())?; let _ = fs::remove_file(archive_path); Ok(root.join(java_candidate.strip_prefix(&temp).unwrap_or(Path::new("bin\\javaw.exe"))))
 }
 
 #[tauri::command]
@@ -118,12 +144,13 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
 }
 
 #[tauri::command]
-fn launch_minecraft(username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>) -> Result<(), String> {
+async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>) -> Result<(), String> {
     if username.trim().is_empty() { return Err("Введите ник".into()); }
-    let ram = ram_mb.clamp(2048, 8192); let java = java_path.filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "javaw.exe".into());
-    let version_id = launcher_config().map(|config| config.launch_version_id).unwrap_or_else(|_| VERSION_ID.to_string());
-    let jar = launcher_jar.unwrap_or_else(|| format!("{game_dir}/versions/{version_id}/{version_id}.jar"));
-    Command::new(java).args([format!("-Xmx{ram}M"), format!("-Xms{ram}M"), "-jar".into(), jar, "--username".into(), username, "--gameDir".into(), game_dir, "--version".into(), version_id]).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
+    let ram = ram_mb.clamp(2048, 8192); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
+    let game_path = expand_windows_path(&game_dir); let version_id = launcher_config().map(|config| config.launch_version_id).unwrap_or_else(|_| VERSION_ID.to_string());
+    let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
+    if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
+    Command::new(java).args([format!("-Xmx{ram}M"), format!("-Xms{ram}M"), "-jar".into(), jar.to_string_lossy().to_string(), "--username".into(), username, "--gameDir".into(), game_path.to_string_lossy().to_string(), "--version".into(), version_id]).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
 }
 
 #[tauri::command]
