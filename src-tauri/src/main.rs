@@ -48,6 +48,28 @@ struct PackManifest {
     loader: LoaderManifest,
 }
 
+#[derive(Deserialize)]
+struct VersionProfile {
+    main_class: Option<String>,
+    arguments: Option<LaunchArguments>,
+    libraries: Option<Vec<LibraryEntry>>,
+}
+
+#[derive(Deserialize)]
+struct LaunchArguments { jvm: Option<Vec<serde_json::Value>>, game: Option<Vec<serde_json::Value>> }
+
+fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)]) -> Vec<String> {
+    values.iter().filter_map(|value| value.as_str()).map(|value| {
+        replacements.iter().fold(value.to_string(), |text, (key, replacement)| text.replace(key, replacement))
+    }).collect()
+}
+
+#[derive(Deserialize)]
+struct LibraryEntry { artifact: Option<LibraryArtifact> }
+
+#[derive(Deserialize)]
+struct LibraryArtifact { path: String }
+
 #[derive(Deserialize, Serialize)]
 struct LoaderManifest {
     r#type: String,
@@ -153,7 +175,15 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
     let config = launcher_config()?; let server = format!("{}:{}", config.server_address, config.server_port);
-    Command::new(java).args([format!("-Xmx{ram}M"), format!("-Xms{ram}M"), "-jar".into(), jar.to_string_lossy().to_string(), "--username".into(), username, "--gameDir".into(), game_path.to_string_lossy().to_string(), "--version".into(), version_id, "--server".into(), config.server_address, "--port".into(), config.server_port.to_string()]).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
+    let profile_text = fs::read_to_string(game_path.join("versions").join(&version_id).join(format!("{version_id}.json"))).map_err(|e| format!("Не найден профиль Minecraft {version_id}: {e}"))?;
+    let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
+    let libraries = profile.libraries.unwrap_or_default().into_iter().filter_map(|library| library.artifact.map(|a| game_path.join(a.path))).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
+    let classpath = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).collect::<Vec<_>>().join(";");
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "0".into()), ("${classpath}", classpath), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())];
+    let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{ram}M")];
+    if let Some(profile_args) = profile.arguments { if let Some(jvm) = profile_args.jvm { args.extend(profile_values(&jvm.iter().flat_map(|v| v.get("values").into_iter().flat_map(|x| x.as_array().into_iter().flatten().cloned())).collect::<Vec<_>>(), &replacements)); } }
+    args.extend(["-cp".into(), classpath, profile.main_class.unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into()), "--username".into(), username, "--version".into(), version_id, "--gameDir".into(), game_path.to_string_lossy().to_string(), "--server".into(), config.server_address, "--port".into(), config.server_port.to_string()]);
+    Command::new(java).args(args).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
 }
 
 #[tauri::command]
