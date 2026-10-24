@@ -160,8 +160,15 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     // the configured ZIP asset are considered, so launcher binaries are ignored.
     let release = releases.into_iter().find(|release| release.assets.iter().any(|asset| asset.name == config.modpack_asset));
     let release = release.ok_or_else(|| format!("В GitHub Releases нет опубликованной сборки с asset {}", config.modpack_asset))?;
-    let latest = release.tag_name.trim_start_matches('v').to_string();
-    if latest == local_version.trim_start_matches('v') { return Ok(latest); }
+    let latest = release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string();
+    let target = expand_windows_path(&target_dir);
+    let marker = target.join(".gorizont-installed.json");
+    if let Ok(text) = fs::read_to_string(&marker) {
+        if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
+            if validate_manifest(&installed, &config).is_ok() && installed.pack_version == latest { return Ok(latest); }
+        }
+    }
+    if latest == local_version.trim_start_matches('v') && marker.exists() { return Ok(latest); }
     let asset = release.assets.iter().find(|a| a.name == config.modpack_asset).ok_or_else(|| format!("В релизе нет файла {}", config.modpack_asset))?;
     download_and_extract_modpack(app, asset.browser_download_url.clone(), target_dir, None).await?;
     Ok(latest)
