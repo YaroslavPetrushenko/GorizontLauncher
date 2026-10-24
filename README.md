@@ -57,7 +57,9 @@ git push origin launcher-v1.0.0
   "minecraft_version": "1.21.1",
   "launch_version_id": "1.21.1-neoforge",
   "loader_type": "neoforge",
-  "loader_version": "248"
+  "loader_version": "248",
+  "server_address": "mc.gorizont.fun",
+  "server_port": 20054
 }
 ```
 

@@ -35,6 +35,8 @@ struct LauncherConfig {
     launch_version_id: String,
     loader_type: String,
     loader_version: String,
+    server_address: String,
+    server_port: u16,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -150,7 +152,8 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let game_path = expand_windows_path(&game_dir); let version_id = launcher_config().map(|config| config.launch_version_id).unwrap_or_else(|_| VERSION_ID.to_string());
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
-    Command::new(java).args([format!("-Xmx{ram}M"), format!("-Xms{ram}M"), "-jar".into(), jar.to_string_lossy().to_string(), "--username".into(), username, "--gameDir".into(), game_path.to_string_lossy().to_string(), "--version".into(), version_id]).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
+    let config = launcher_config()?; let server = format!("{}:{}", config.server_address, config.server_port);
+    Command::new(java).args([format!("-Xmx{ram}M"), format!("-Xms{ram}M"), "-jar".into(), jar.to_string_lossy().to_string(), "--username".into(), username, "--gameDir".into(), game_path.to_string_lossy().to_string(), "--version".into(), version_id, "--server".into(), config.server_address, "--port".into(), config.server_port.to_string()]).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
 }
 
 #[tauri::command]
