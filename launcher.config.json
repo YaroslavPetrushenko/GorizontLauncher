@@ -1,0 +1,7 @@
+{
+  "github_owner": "YaroslavPetrushenko",
+  "github_repo": "GorizontLauncher",
+  "modpack_asset": "modpack.zip",
+  "release_mode": "modpack-only",
+  "minecraft_version": "1.21.1-neoforge"
+}

@@ -1,0 +1,2 @@
+const news = [{ date: 'СЕГОДНЯ', title: 'Добро пожаловать в Gorizont', text: 'Новая сборка уже доступна. Обновления устанавливаются автоматически.' }, { date: 'ОБНОВЛЕНИЕ', title: 'NeoForge 1.21.1', text: 'Исследуйте новые механики и играйте вместе с друзьями.' }];
+export default function News() { return <aside className="news"><div className="section-kicker">ПОСЛЕДНИЕ СОБЫТИЯ</div>{news.map(item => <article className="news-card" key={item.title}><span>{item.date}</span><h3>{item.title}</h3><p>{item.text}</p></article>)}</aside>; }
