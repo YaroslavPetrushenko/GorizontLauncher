@@ -87,6 +87,16 @@ AuthMe Reloaded остаётся серверной системой автор�
 
 Если `modpack.zip` ещё не опубликован, запуск блокируется понятным сообщением: сначала нужно опубликовать сборку с `manifest.json` и клиентскими файлами.
 
+## Подготовка сборки из папки
+
+Когда клиентская папка будет готова, можно создать правильный архив одной командой:
+
+```powershell
+.\tools\New-ModpackZip.ps1 -Source "E:\GorizontPack" -PackVersion "1.0.0" -Output "modpack.zip"
+```
+
+Скрипт добавляет в корень ZIP правильный `manifest.json` с Minecraft 1.21.1 и NeoForge 248. Затем создай GitHub Release с тегом `pack-1.0.0` и прикрепи получившийся `modpack.zip`.
+
 ## Запуск разработки
 
 ```powershell
