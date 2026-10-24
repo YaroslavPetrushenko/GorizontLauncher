@@ -87,6 +87,7 @@ fn releases_api_url(config: &LauncherConfig) -> String {
 #[derive(Clone, Serialize)] struct DownloadProgress { downloaded: u64, total: Option<u64>, percent: f32, stage: String }
 #[derive(Deserialize)] struct Release { tag_name: String, assets: Vec<Asset> }
 #[derive(Deserialize)] struct Asset { name: String, browser_download_url: String }
+#[derive(Clone, Serialize)] struct LauncherUpdate { version: String, url: String, size: u64 }
 
 fn validate_manifest(manifest: &PackManifest, config: &LauncherConfig) -> Result<(), String> {
     if manifest.schema_version != 1 { return Err(format!("Неподдерживаемая версия manifest.json: {}", manifest.schema_version)); }
@@ -136,6 +137,15 @@ async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: S
     let cursor = io::Cursor::new(bytes); let mut archive = ZipArchive::new(cursor).map_err(|e| e.to_string())?; let manifest = safe_extract(&mut archive, &target, &config)?;
     fs::write(target.join(".gorizont-installed.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     emit_progress(&app, "Готово", 1, Some(1)); Ok(())
+}
+
+#[tauri::command]
+async fn check_launcher_update() -> Result<Option<LauncherUpdate>, String> {
+    let config = launcher_config()?;
+    let releases: Vec<serde_json::Value> = reqwest::Client::new().get(releases_api_url(&config)).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    let current = env!("CARGO_PKG_VERSION");
+    for release in releases { let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default(); if !tag.starts_with("launcher-v") { continue; } let version = tag.trim_start_matches("launcher-v"); if version <= current { continue; } if let Some(asset) = release.get("assets").and_then(|v| v.as_array()).and_then(|assets| assets.iter().find(|a| a.get("name").and_then(|v| v.as_str()).map(|n| n.ends_with("-setup.exe")).unwrap_or(false))) { return Ok(Some(LauncherUpdate { version: version.into(), url: asset.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or_default().into(), size: asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0) })); } }
+    Ok(None)
 }
 
 #[tauri::command]
@@ -199,4 +209,4 @@ async fn link_ip_to_account(username: String) -> Result<(), String> {
     Client::new().post(WEBHOOK_URL).bearer_auth(WEBHOOK_TOKEN).json(&serde_json::json!({"username": username})).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?; Ok(())
 }
 
-fn main() { tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![download_and_extract_modpack, check_and_update_modpack, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); }
+fn main() { tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![download_and_extract_modpack, check_and_update_modpack, check_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); }
