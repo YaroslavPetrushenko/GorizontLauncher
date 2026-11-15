@@ -12,7 +12,7 @@ import type { DownloadProgress, Settings } from './types';
 
 type LauncherUpdate = { version: string; url: string; size: number };
 
-const defaults: Settings = { ram: 4096, gameDir: '%APPDATA%/.GorizontLauncher', localVersion: '0.0.0' };
+const defaults: Settings = { ram: 4096, gameDir: '%APPDATA%/.minecraft', localVersion: '0.0.0' };
 export default function App() {
   const [username, setUsername] = useState(''); const [password, setPassword] = useState('');
   const [settings, setSettings] = useState<Settings>(() => { try { return { ...defaults, ...JSON.parse(localStorage.getItem('gorizont-settings') || '{}') }; } catch { return defaults; } });

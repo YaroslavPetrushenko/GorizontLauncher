@@ -19,6 +19,64 @@ fn expand_windows_path(input: &str) -> PathBuf {
     PathBuf::from(value.replace('/', "\\"))
 }
 
+fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_assets(target: &Path) -> Result<(), String> {
+    // Copy libraries from default .minecraft if missing
+    let libs_dir = target.join("libraries");
+    let libs_exist = libs_dir.exists() && libs_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    if !libs_exist {
+        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_libs = default_mc.join("libraries");
+        if default_libs.exists() {
+            eprintln!("[ASSETS] Copying libraries from {}", default_libs.display());
+            copy_dir_all(&default_libs, &libs_dir).map_err(|e| format!("Не удалось скопировать библиотеки: {e}"))?;
+            eprintln!("[ASSETS] Libraries copied");
+        }
+    }
+
+    // Copy mods from default .minecraft if missing
+    let mods_dir = target.join("mods");
+    let mods_exist = mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    if !mods_exist {
+        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_mods = default_mc.join("mods");
+        if default_mods.exists() {
+            eprintln!("[ASSETS] Copying mods from {}", default_mods.display());
+            copy_dir_all(&default_mods, &mods_dir).map_err(|e| format!("Не удалось скопировать моды: {e}"))?;
+            eprintln!("[ASSETS] Mods copied");
+        }
+    }
+
+    // Copy config from default .minecraft if missing
+    let config_dir = target.join("config");
+    let config_exist = config_dir.exists() && config_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    if !config_exist {
+        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_config = default_mc.join("config");
+        if default_config.exists() {
+            eprintln!("[ASSETS] Copying config from {}", default_config.display());
+            copy_dir_all(&default_config, &config_dir).map_err(|e| format!("Не удалось скопировать конфиг: {e}"))?;
+            eprintln!("[ASSETS] Config copied");
+        }
+    }
+
+    Ok(())
+}
+
 fn launcher_data_dir() -> Result<PathBuf, String> {
     let base = env::var("LOCALAPPDATA").map_err(|_| "Не удалось определить LOCALAPPDATA".to_string())?;
     let path = PathBuf::from(base).join("GorizontLauncher"); fs::create_dir_all(&path).map_err(|e| e.to_string())?; Ok(path)
@@ -245,6 +303,10 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     let profile_dir = target.join("versions").join(&version_id);
     let jar_exists = profile_dir.join(format!("{}.jar", version_id)).exists();
     let json_exists = profile_dir.join(format!("{}.json", version_id)).exists();
+    let libs_dir = target.join("libraries");
+    let libs_exist = libs_dir.exists() && libs_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    let mods_dir = target.join("mods");
+    let mods_exist = mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
     
     // FIRST: Check if already installed with valid marker and correct version folder
     if let Ok(text) = fs::read_to_string(&marker) {
@@ -253,11 +315,11 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
             log(&format!("manifest parsed: pack_version={}", installed.pack_version));
             if validate_manifest(&installed, &effective_config).is_ok() {
                 log("manifest validation passed");
-                if jar_exists && json_exists {
-                    log("jar and json exist, returning installed version");
+                if jar_exists && json_exists && libs_exist {
+                    log("jar, json and libraries exist, returning installed version");
                     return Ok(installed.pack_version);
                 } else {
-                    log(&format!("jar_exists={}, json_exists={}, profile_dir={:?}", jar_exists, json_exists, profile_dir));
+                    log(&format!("jar_exists={}, json_exists={}, libs_exist={}, mods_exist={}, profile_dir={:?}", jar_exists, json_exists, libs_exist, mods_exist, profile_dir));
                 }
             } else {
                 log("manifest validation FAILED");
@@ -272,7 +334,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
         let local_path = expand_windows_path(local_path);
         if local_path.exists() {
             log("Using local modpack as primary source");
-            if !marker.exists() || !jar_exists || !json_exists {
+            if !marker.exists() || !jar_exists || !json_exists || !libs_exist || !mods_exist {
                 log("Installing from local modpack...");
                 let bytes = fs::read(&local_path).map_err(|e| format!("Не удалось прочитать локальный модпак: {e}"))?;
                 log(&format!("Read modpack zip: {} bytes", bytes.len()));
@@ -337,6 +399,11 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                     io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
                 }
                 log("All files extracted");
+                
+                // Ensure libraries, mods and config exist (copy from default .minecraft if missing)
+                if let Err(e) = ensure_assets(&target) {
+                    log(&format!("Warning: {}", e));
+                }
                 
                 // Fix: modpack.zip contains old folder name "Create(VOID)", rename to expected version_id
                 let old_profile_dir = target.join("versions").join("Create(VOID)");
