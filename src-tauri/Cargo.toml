@@ -16,6 +16,7 @@ zip = "2"
 tokio = { version = "1", features = ["fs", "io-util"] }
 futures-util = "0.3"
 sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
 
 [features]
 default = ["custom-protocol"]

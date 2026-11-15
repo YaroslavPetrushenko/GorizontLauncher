@@ -1,10 +1,10 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "console")]
 
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{env, fs, io::{self, Read}, path::{Path, PathBuf}, process::Command};
+use std::{env, fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::Command};
 use tauri::{AppHandle, Emitter};
 use zip::ZipArchive;
 
@@ -36,6 +36,8 @@ struct LauncherConfig {
     loader_version: String,
     server_address: String,
     server_port: u16,
+    #[serde(default)]
+    local_modpack_path: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -144,6 +146,7 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
 
 #[tauri::command]
 async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: String, expected_sha256: Option<String>) -> Result<(), String> {
+    eprintln!("[DEBUG] download_and_extract_modpack called: url={}, target_dir={}", url, target_dir);
     let target = expand_windows_path(&target_dir); fs::create_dir_all(&target).map_err(|e| e.to_string())?; let config = launcher_config()?;
     let response = reqwest::Client::new().get(&url).header("User-Agent", "GorizontLauncher/0.1").send().await.map_err(|e| e.to_string())?;
     let total = response.content_length(); let mut downloaded = 0; let mut bytes = Vec::new(); let mut stream = response.bytes_stream();
@@ -191,55 +194,210 @@ async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
 
 #[tauri::command]
 async fn check_and_update_modpack(app: AppHandle, local_version: String, target_dir: String) -> Result<String, String> {
+    let log_file = std::env::temp_dir().join("gorizont_launcher.log");
+    let log = |msg: &str| {
+        let _ = fs::OpenOptions::new().create(true).append(true).open(&log_file).and_then(|mut f| f.write_all(format!("[{}] {}\n", chrono::Local::now().format("%H:%M:%S%.3f"), msg).as_bytes()));
+    };
+    log(&format!("check_and_update_modpack called: local_version={}, target_dir={}", local_version, target_dir));
+    eprintln!("check_and_update_modpack called: local_version={}, target_dir={}", local_version, target_dir);
+    std::io::stderr().flush().ok();
     let config = launcher_config()?;
-    let releases: Vec<Release> = reqwest::Client::new().get(releases_api_url(&config)).header("User-Agent", "GorizontLauncher/0.1").send().await.map_err(|e| format!("Не удалось получить релизы GitHub: {e}"))?.error_for_status().map_err(|e| format!("GitHub не вернул релизы: {e}"))?.json().await.map_err(|e| format!("Некорректный ответ GitHub: {e}"))?;
-    // The launcher release is separate from modpack releases. Only releases carrying
-    // the configured ZIP asset are considered, so launcher binaries are ignored.
-    let release = releases.into_iter().find(|release| release.assets.iter().any(|asset| asset.name == config.modpack_asset));
-    let release = release.ok_or_else(|| format!("В GitHub Releases нет опубликованной сборки с asset {}", config.modpack_asset))?;
-    let latest = release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string();
+    log(&format!("config loaded: mc={}, loader={}, loader_ver={}", config.minecraft_version, config.loader_type, config.loader_version));
+    log(&format!("local_modpack_path={:?}", config.local_modpack_path));
     let target = expand_windows_path(&target_dir);
+    log(&format!("target_dir expanded={:?}", target));
     let marker = target.join(".gorizont-installed.json");
-    if let Ok(text) = fs::read_to_string(&marker) {
-        if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
-            if validate_manifest(&installed, &config).is_ok() { return Ok(installed.pack_version); }
-        }
-    }
-    if latest == local_version.trim_start_matches('v') && marker.exists() { return Ok(latest); }
-    // A manually pre-installed client profile is also a valid installation. Do not overwrite it
-    // with a 236 MB download merely because this launcher has not written its marker yet.
+    log(&format!("marker={:?}, exists={}", marker, marker.exists()));
+    
     let version_id = version_id(&config);
     let profile_dir = target.join("versions").join(&version_id);
-    if profile_dir.join(format!("{}.jar", version_id)).exists() && profile_dir.join(format!("{}.json", version_id)).exists() {
-        let installed = PackManifest { schema_version: 1, pack_id: config.pack_id.clone(), pack_version: latest.clone(), minecraft_version: config.minecraft_version.clone(), loader: LoaderManifest { r#type: config.loader_type.clone(), version: config.loader_version.clone() } };
-        fs::write(&marker, serde_json::to_vec_pretty(&installed).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        return Ok(latest);
+    let jar_exists = profile_dir.join(format!("{}.jar", version_id)).exists();
+    let json_exists = profile_dir.join(format!("{}.json", version_id)).exists();
+    
+    // FIRST: Check if already installed with valid marker and correct version folder
+    if let Ok(text) = fs::read_to_string(&marker) {
+        log(&format!("marker read, installed version={:?}", text));
+        if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
+            log(&format!("manifest parsed: pack_version={}", installed.pack_version));
+            if validate_manifest(&installed, &config).is_ok() {
+                log("manifest validation passed");
+                if jar_exists && json_exists {
+                    log("jar and json exist, returning installed version");
+                    return Ok(installed.pack_version);
+                } else {
+                    log(&format!("jar_exists={}, json_exists={}, profile_dir={:?}", jar_exists, json_exists, profile_dir));
+                }
+            } else {
+                log("manifest validation FAILED");
+            }
+        } else {
+            log("failed to parse manifest JSON");
+        }
     }
-    let asset = release.assets.iter().find(|a| a.name == config.modpack_asset).ok_or_else(|| format!("В релизе нет файла {}", config.modpack_asset))?;
-    download_and_extract_modpack(app, asset.browser_download_url.clone(), target_dir, None).await?;
-    Ok(latest)
+    
+    // SECOND: If local_modpack_path is configured, use it as primary source
+    if let Some(local_path) = &config.local_modpack_path {
+        let local_path = expand_windows_path(local_path);
+        if local_path.exists() {
+            log("Using local modpack as primary source");
+            if !marker.exists() || !jar_exists || !json_exists {
+                log("Installing from local modpack...");
+                let bytes = fs::read(&local_path).map_err(|e| format!("Не удалось прочитать локальный модпак: {e}"))?;
+                log(&format!("Read modpack zip: {} bytes", bytes.len()));
+                let cursor = io::Cursor::new(bytes);
+                let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Некорректный ZIP архив: {e}"))?;
+                log(&format!("Zip archive opened, {} files", archive.len()));
+                log("safe_extract bypassed - reading manifest directly from zip...");
+                // Read manifest.json directly from zip
+                let manifest_name = config.expected_manifest.clone();
+                let mut manifest_text = String::new();
+                let mut manifest_found = false;
+                for i in 0..archive.len() {
+                    let mut file = archive.by_index(i).map_err(|e| format!("Failed to read zip entry {}: {}", i, e))?;
+                    if let Some(name) = file.enclosed_name() {
+                        if name.to_string_lossy() == manifest_name {
+                            file.read_to_string(&mut manifest_text).map_err(|e| format!("Failed to read manifest: {}", e))?;
+                            manifest_found = true;
+                            break;
+                        }
+                    }
+                }
+                if !manifest_found {
+                    return Err(format!("manifest.json не найден в архиве"));
+                }
+                log(&format!("manifest.json read, length={}, content={:?}", manifest_text.len(), manifest_text));
+                // Strip UTF-8 BOM if present
+                let manifest_text = manifest_text.trim_start_matches('\u{feff}');
+                // Fix double-quoted keys like ""schema_version"" -> "schema_version"
+                let manifest_text = manifest_text.replace("\"\"", "\"");
+                log(&format!("manifest after BOM/quote fix: {:?}", manifest_text));
+                let manifest_result: Result<PackManifest, _> = serde_json::from_str(&manifest_text);
+                let manifest = match manifest_result {
+                    Ok(m) => {
+                        log(&format!("manifest parsed OK: pack_id={}, pack_version={}, loader={} {}", m.pack_id, m.pack_version, m.loader.r#type, m.loader.version));
+                        m
+                    }
+                    Err(e) => {
+                        log(&format!("serde_json::from_str FAILED: {}", e));
+                        return Err(format!("Некорректный manifest.json: {}", e));
+                    }
+                };
+                validate_manifest(&manifest, &config)?;
+                log("manifest validation passed");
+                
+                // Extract all files from zip
+                log("Extracting all files from zip...");
+                // Reset cursor to beginning for re-reading
+                let cursor2 = io::Cursor::new(fs::read(&local_path).map_err(|e| format!("Не удалось прочитать локальный модпак: {e}"))?);
+                let mut archive2 = ZipArchive::new(cursor2).map_err(|e| format!("Некорректный ZIP архив: {}", e))?;
+                for i in 0..archive2.len() {
+                    let mut file = archive2.by_index(i).map_err(|e| e.to_string())?;
+                    let enclosed = file.enclosed_name().ok_or_else(|| "Небезопасный путь в архиве".to_string())?.to_owned();
+                    let out = target.join(&enclosed);
+                    if file.is_dir() {
+                        fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+                        continue;
+                    }
+                    if let Some(parent) = out.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    let mut output = fs::File::create(&out).map_err(|e| e.to_string())?;
+                    io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
+                }
+                log("All files extracted");
+                
+                // Fix: modpack.zip contains old folder name "Create(VOID)", rename to expected version_id
+                let old_profile_dir = target.join("versions").join("Create(VOID)");
+                let new_profile_dir = target.join("versions").join(&version_id);
+                log(&format!("After extract: old_profile_dir exists={}, new_profile_dir exists={}", old_profile_dir.exists(), new_profile_dir.exists()));
+                if old_profile_dir.exists() && !new_profile_dir.exists() {
+                    log(&format!("Renaming version folder: Create(VOID) -> {}", version_id));
+                    fs::rename(&old_profile_dir, &new_profile_dir).map_err(|e| format!("Не удалось переименовать папку версии: {e}"))?;
+                    let old_jar = new_profile_dir.join("Create(VOID).jar");
+                    let new_jar = new_profile_dir.join(format!("{}.jar", version_id));
+                    log(&format!("Renaming jar: {} -> {} (exists={})", old_jar.display(), new_jar.display(), old_jar.exists()));
+                    if old_jar.exists() { fs::rename(&old_jar, &new_jar).map_err(|e| log(&format!("jar rename failed: {}", e))).ok(); }
+                    let old_json = new_profile_dir.join("Create(VOID).json");
+                    let new_json = new_profile_dir.join(format!("{}.json", version_id));
+                    log(&format!("Renaming json: {} -> {} (exists={})", old_json.display(), new_json.display(), old_json.exists()));
+                    if old_json.exists() { fs::rename(&old_json, &new_json).map_err(|e| log(&format!("json rename failed: {}", e))).ok(); }
+                }
+                
+                // Verify final state
+                let final_jar = new_profile_dir.join(format!("{}.jar", version_id));
+                let final_json = new_profile_dir.join(format!("{}.json", version_id));
+                log(&format!("Final check: jar_exists={}, json_exists={}", final_jar.exists(), final_json.exists()));
+                
+                // Write updated marker with correct version from manifest
+                let installed_version = manifest.pack_version.clone();
+                fs::write(target.join(".gorizont-installed.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                log(&format!("Local modpack installed, version={}", installed_version));
+                return Ok(installed_version);
+            } else {
+                log("Local modpack already installed, returning version from marker");
+                if let Ok(text) = fs::read_to_string(&marker) {
+                    if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
+                        return Ok(installed.pack_version);
+                    }
+                }
+                return Ok("local".to_string());
+            }
+        }
+    }
+    
+    // THIRD: Fallback to GitHub releases (only if no local modpack configured)
+    let client = reqwest::Client::new();
+    if let Ok(response) = client.get(releases_api_url(&config)).header("User-Agent", "GorizontLauncher/0.1").send().await {
+        if let Ok(response) = response.error_for_status() {
+            if let Ok(releases) = response.json::<Vec<Release>>().await {
+                if let Some(release) = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == config.modpack_asset)) {
+                    let latest = release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string();
+                    let asset_url = release.assets.iter().find(|a| a.name == config.modpack_asset).map(|a| a.browser_download_url.clone());
+                    log(&format!("GitHub fallback: latest={}, local_version={}", latest, local_version));
+                    if let Some(asset_url) = asset_url {
+                        if latest != local_version.trim_start_matches('v') || !marker.exists() || !jar_exists || !json_exists {
+                            log("Downloading from GitHub...");
+                            download_and_extract_modpack(app, asset_url, target_dir, None).await?;
+                            return Ok(latest);
+                        }
+                        return Ok(latest);
+                    }
+                }
+            }
+        }
+    }
+    
+    log("No modpack source available");
+    Err("Не найден модпак: не настроен локальный путь и нет релиза на GitHub".into())
 }
 
 #[tauri::command]
 async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>) -> Result<(), String> {
+    eprintln!("[LAUNCH] launch_minecraft called: username={}, ram_mb={}, game_dir={}", username, ram_mb, game_dir);
     if username.trim().is_empty() { return Err("Введите ник".into()); }
     let ram = ram_mb.clamp(2048, 8192); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
+    eprintln!("[LAUNCH] java path: {:?}", java);
     let game_path = expand_windows_path(&game_dir); let config = launcher_config()?; let version_id = version_id(&config);
+    eprintln!("[LAUNCH] game_path={:?}, version_id={}", game_path, version_id);
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
+    eprintln!("[LAUNCH] jar path: {:?}, exists={}", jar, jar.exists());
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
     let server = format!("{}:{}", config.server_address, config.server_port);
     let profile_text = fs::read_to_string(game_path.join("versions").join(&version_id).join(format!("{version_id}.json"))).map_err(|e| format!("Не найден профиль Minecraft {version_id}: {e}"))?;
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
     let libraries = profile.libraries.unwrap_or_default().into_iter().filter_map(|library| library.artifact.map(|a| game_path.join(a.path))).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
     let classpath = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).collect::<Vec<_>>().join(";");
-    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", config.minecraft_version.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())];
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", config.minecraft_version.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
     let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
     let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{ram}M")];
     if let Some(jvm) = jvm { args.extend(profile_values(&jvm, &replacements)); }
     args.extend(["-cp".into(), classpath, profile.main_class.unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into())]);
     if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
     args.extend(["--server".into(), config.server_address, "--port".into(), config.server_port.to_string()]);
-    Command::new(java).args(args).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; Ok(())
+    eprintln!("[LAUNCH] spawning java with args: {:?}", args);
+    Command::new(java).args(args).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; 
+    eprintln!("[LAUNCH] Java spawned successfully");
+    Ok(())
 }
 
 #[tauri::command]
@@ -248,4 +406,10 @@ async fn link_ip_to_account(username: String) -> Result<(), String> {
     Client::new().post(WEBHOOK_URL).bearer_auth(WEBHOOK_TOKEN).json(&serde_json::json!({"username": username})).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?; Ok(())
 }
 
-fn main() { tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); }
+fn main() { 
+    eprintln!("[MAIN] Starting Gorizont Launcher");
+    std::io::stderr().flush().ok();
+    // Test file write
+    let _ = std::fs::write("C:\\test_launcher.txt", "MAIN CALLED");
+    tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
+}
