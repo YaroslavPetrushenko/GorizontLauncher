@@ -32,7 +32,6 @@ struct LauncherConfig {
     expected_manifest: String,
     pack_id: String,
     minecraft_version: String,
-    launch_version_id: String,
     loader_type: String,
     loader_version: String,
     server_address: String,
@@ -85,6 +84,10 @@ struct LoaderManifest {
 
 fn launcher_config() -> Result<LauncherConfig, String> {
     serde_json::from_str(include_str!("../../launcher.config.json")).map_err(|e| format!("Ошибка launcher.config.json: {e}"))
+}
+
+fn version_id(config: &LauncherConfig) -> String {
+    format!("{}-{}-{}", config.minecraft_version, config.loader_type, config.loader_version)
 }
 
 fn releases_api_url(config: &LauncherConfig) -> String {
@@ -205,8 +208,9 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     if latest == local_version.trim_start_matches('v') && marker.exists() { return Ok(latest); }
     // A manually pre-installed client profile is also a valid installation. Do not overwrite it
     // with a 236 MB download merely because this launcher has not written its marker yet.
-    let profile_dir = target.join("versions").join(&config.launch_version_id);
-    if profile_dir.join(format!("{}.jar", config.launch_version_id)).exists() && profile_dir.join(format!("{}.json", config.launch_version_id)).exists() {
+    let version_id = version_id(&config);
+    let profile_dir = target.join("versions").join(&version_id);
+    if profile_dir.join(format!("{}.jar", version_id)).exists() && profile_dir.join(format!("{}.json", version_id)).exists() {
         let installed = PackManifest { schema_version: 1, pack_id: config.pack_id.clone(), pack_version: latest.clone(), minecraft_version: config.minecraft_version.clone(), loader: LoaderManifest { r#type: config.loader_type.clone(), version: config.loader_version.clone() } };
         fs::write(&marker, serde_json::to_vec_pretty(&installed).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         return Ok(latest);
@@ -220,10 +224,10 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
 async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>) -> Result<(), String> {
     if username.trim().is_empty() { return Err("Введите ник".into()); }
     let ram = ram_mb.clamp(2048, 8192); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
-    let game_path = expand_windows_path(&game_dir); let version_id = launcher_config().map(|config| config.launch_version_id).unwrap_or_else(|_| VERSION_ID.to_string());
+    let game_path = expand_windows_path(&game_dir); let config = launcher_config()?; let version_id = version_id(&config);
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
-    let config = launcher_config()?; let server = format!("{}:{}", config.server_address, config.server_port);
+    let server = format!("{}:{}", config.server_address, config.server_port);
     let profile_text = fs::read_to_string(game_path.join("versions").join(&version_id).join(format!("{version_id}.json"))).map_err(|e| format!("Не найден профиль Minecraft {version_id}: {e}"))?;
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
     let libraries = profile.libraries.unwrap_or_default().into_iter().filter_map(|library| library.artifact.map(|a| game_path.join(a.path))).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
