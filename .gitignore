@@ -8,3 +8,9 @@ target/
 !.env.example
 *.log
 modpack.zip
+
+# Local tooling / generated files
+.cheburnexus/
+.claude/
+*.tsbuildinfo
+src-tauri/gen/
