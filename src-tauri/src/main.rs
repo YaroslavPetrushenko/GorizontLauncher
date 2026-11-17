@@ -226,6 +226,32 @@ fn emit_progress(app: &AppHandle, stage: &str, downloaded: u64, total: Option<u6
     let _ = app.emit("download-progress", DownloadProgress { downloaded, total, percent, stage: stage.to_string() });
 }
 
+/// After a modpack update, move mod jars that are no longer part of the pack into `mods-old`
+/// so old and new versions of the same mod are never loaded together.
+fn retire_stale_mods<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Path) {
+    let mut keep = std::collections::HashSet::new();
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            if let Some(name) = file.enclosed_name() {
+                if name.parent().map(|p| p == Path::new("mods")).unwrap_or(false) { if let Some(n) = name.file_name() { keep.insert(n.to_string_lossy().to_string()); } }
+            }
+        }
+    }
+    if keep.is_empty() { return; }
+    let mods_dir = target.join("mods");
+    let old_dir = target.join("mods-old");
+    if let Ok(entries) = fs::read_dir(&mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_file() && name.to_lowercase().ends_with(".jar") && !keep.contains(&name) {
+                let _ = fs::create_dir_all(&old_dir);
+                let _ = fs::rename(&path, old_dir.join(&name));
+            }
+        }
+    }
+}
+
 fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Path, config: &LauncherConfig) -> Result<PackManifest, String> {
     if archive.len() > 20_000 { return Err("Архив содержит слишком много файлов".into()); }
     let mut manifest: Option<PackManifest> = None;
@@ -244,6 +270,7 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
         io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
     }
     let manifest = manifest.ok_or_else(|| format!("В корне modpack.zip отсутствует {}", config.expected_manifest))?;
+    retire_stale_mods(archive, target);
     validate_manifest(&manifest, config)?;
     Ok(manifest)
 }
@@ -487,6 +514,101 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     Err("Не найден модпак: не настроен локальный путь и нет релиза на GitHub".into())
 }
 
+fn library_allowed(library: &serde_json::Value) -> bool {
+    if let Some(name) = library.get("name").and_then(|n| n.as_str()) { if name.ends_with("natives-windows-arm64") || name.ends_with("natives-windows-x86") { return false; } }
+    match library.get("rules").and_then(|r| r.as_array()) {
+        Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
+        None => true,
+    }
+}
+
+async fn fetch_to(client: &reqwest::Client, urls: &[String], dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let mut last = String::from("нет адресов для загрузки");
+    for url in urls {
+        match client.get(url).header("User-Agent", "GorizontLauncher/1.0").send().await.and_then(|r| r.error_for_status()) {
+            Ok(response) => match response.bytes().await {
+                Ok(bytes) => { let tmp = dest.with_extension("part"); fs::write(&tmp, &bytes).map_err(|e| e.to_string())?; fs::rename(&tmp, dest).map_err(|e| e.to_string())?; return Ok(()); }
+                Err(e) => last = format!("{url}: {e}"),
+            },
+            Err(e) => last = format!("{url}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// Downloads libraries and assets that the version profile needs but are missing on disk (fresh installs).
+async fn ensure_game_files(app: &AppHandle, game_path: &Path, version_id: &str) -> Result<(), String> {
+    let profile_path = game_path.join("versions").join(version_id).join(format!("{version_id}.json"));
+    let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(&profile_path).map_err(|e| format!("Не найден профиль Minecraft: {e}"))?).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
+    let client = reqwest::Client::new();
+
+    // Libraries
+    let mut jobs: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for library in profile.get("libraries").and_then(|l| l.as_array()).cloned().unwrap_or_default() {
+        if !library_allowed(&library) { continue; }
+        let Some(artifact) = library.get("artifact").or_else(|| library.get("downloads").and_then(|d| d.get("artifact"))) else { continue };
+        let Some(path) = artifact.get("path").and_then(|p| p.as_str()) else { continue };
+        let relative = path.trim_start_matches("libraries/");
+        let dest = game_path.join("libraries").join(relative);
+        let alt = game_path.join(path);
+        if dest.exists() || alt.exists() { continue; }
+        let mut urls = Vec::new();
+        if let Some(url) = artifact.get("url").and_then(|u| u.as_str()) { if !url.is_empty() { urls.push(url.replace("http://", "https://")); } }
+        urls.push(format!("https://libraries.minecraft.net/{relative}"));
+        urls.push(format!("https://maven.neoforged.net/releases/{relative}"));
+        urls.push(format!("https://repo1.maven.org/maven2/{relative}"));
+        jobs.push((dest, urls));
+    }
+    let total = jobs.len() as u64;
+    if total > 0 {
+        emit_progress(app, "Скачивание библиотек...", 0, Some(total));
+        let done = std::sync::atomic::AtomicU64::new(0);
+        let results: Vec<Result<(), String>> = futures_util::stream::iter(jobs).map(|(dest, urls)| { let client = client.clone(); let done = &done; async move {
+            let r = fetch_to(&client, &urls, &dest).await;
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            emit_progress(app, "Скачивание библиотек...", n, Some(total));
+            r
+        } }).buffer_unordered(8).collect().await;
+        if let Some(Err(e)) = results.into_iter().find(|r| r.is_err()) { return Err(format!("Не удалось скачать библиотеку: {e}")); }
+    }
+
+    // Assets
+    if let Some(index) = profile.get("assetIndex") {
+        let id = index.get("id").and_then(|v| v.as_str()).unwrap_or("legacy");
+        let index_path = game_path.join("assets").join("indexes").join(format!("{id}.json"));
+        if !index_path.exists() {
+            if let Some(url) = index.get("url").and_then(|u| u.as_str()) { fetch_to(&client, &[url.to_string()], &index_path).await.map_err(|e| format!("Не удалось скачать индекс ресурсов: {e}"))?; }
+        }
+        if let Ok(text) = fs::read_to_string(&index_path) {
+            if let Ok(index_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                let mut jobs: Vec<(PathBuf, Vec<String>)> = Vec::new();
+                for (_, object) in index_json.get("objects").and_then(|o| o.as_object()).cloned().unwrap_or_default() {
+                    let Some(hash) = object.get("hash").and_then(|h| h.as_str()) else { continue };
+                    if hash.len() < 2 { continue; }
+                    let dest = game_path.join("assets").join("objects").join(&hash[..2]).join(hash);
+                    if dest.exists() { continue; }
+                    jobs.push((dest, vec![format!("https://resources.download.minecraft.net/{}/{}", &hash[..2], hash)]));
+                }
+                let total = jobs.len() as u64;
+                if total > 0 {
+                    emit_progress(app, "Скачивание ресурсов игры...", 0, Some(total));
+                    let done = std::sync::atomic::AtomicU64::new(0);
+                    let results: Vec<Result<(), String>> = futures_util::stream::iter(jobs).map(|(dest, urls)| { let client = client.clone(); let done = &done; async move {
+                        let r = fetch_to(&client, &urls, &dest).await;
+                        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n % 25 == 0 || n == total { emit_progress(app, "Скачивание ресурсов игры...", n, Some(total)); }
+                        r
+                    } }).buffer_unordered(24).collect().await;
+                    let failed = results.iter().filter(|r| r.is_err()).count();
+                    if failed > 0 { eprintln!("[ASSETS] {failed} asset files failed to download"); }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemMemory { total_mb: u64, available_mb: u64 }
@@ -557,6 +679,7 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
     args.extend(["--server".into(), effective_config.server_address.clone(), "--port".into(), effective_config.server_port.to_string()]);
     eprintln!("[LAUNCH] spawning java with args: {:?}", args);
+    ensure_game_files(&app, &game_path, &version_id).await?;
     // Make sure the Gorizont server is in the multiplayer list.
     match servers::ensure_default_server(&game_path, "Gorizont", &server) { Ok(changed) => eprintln!("[LAUNCH] servers.dat updated={changed}"), Err(e) => eprintln!("[LAUNCH] servers.dat error: {e}") }
     let java_log_path = game_path.join("launcher-java.log");

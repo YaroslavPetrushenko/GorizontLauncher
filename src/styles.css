@@ -30,3 +30,17 @@
 input[type=range]:disabled{opacity:.4}.range-labels{gap:8px}
 .nick-check{display:flex;align-items:center;gap:8px;font-size:11px;line-height:1.4;color:#a1a1aa}.nick-check.premium{color:#a3e635}.nick-check.error{color:#fca5a5}.nick-check img{width:20px;height:20px;border-radius:4px}
 .avatar{overflow:hidden}.avatar img{width:100%;height:100%;display:block}
+
+/* ---- fixed-size window layout (1120x640): everything is anchored, nothing floats ---- */
+html,body,#root{height:100%;overflow:hidden}body{min-width:0}
+.app-shell{display:flex;flex-direction:column;height:100vh;min-height:0}
+.app-shell>.topbar,.app-shell>footer{flex:0 0 auto}
+.app-shell>.content{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 320px;align-items:center;gap:56px;padding:0 64px}
+.app-shell>.content.auth-content{display:flex;justify-content:center;align-items:center}
+.hero{width:100%;max-width:560px;align-self:center}
+.news{align-self:stretch;max-height:none;min-height:0;padding:22px 6px 22px 25px}
+.play-button{position:relative}
+footer{height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 48px;border-top:1px solid #252525;font-size:9px;letter-spacing:1px;color:#52525b}
+.app-shell>.content{grid-template-rows:minmax(0,1fr);overflow:hidden}
+.app-shell>.content .news{height:100%;overflow-y:auto}
+.app-shell>footer{position:relative;bottom:auto;left:auto;right:auto}

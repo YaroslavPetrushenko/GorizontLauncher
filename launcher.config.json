@@ -9,6 +9,5 @@
   "loader_type": "neoforge",
   "loader_version": "248",
   "server_address": "mc.gorizont.fun",
-  "server_port": 20054,
-  "local_modpack_path": "E:/GorizontLauncher/modpack.zip"
+  "server_port": 20054
 }
