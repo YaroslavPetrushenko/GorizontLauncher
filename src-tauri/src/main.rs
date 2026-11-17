@@ -7,6 +7,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{env, fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::{Command, Stdio}};
+use std::thread;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use zip::ZipArchive;
 
@@ -310,7 +312,18 @@ async fn download_launcher_update(app: AppHandle, url: String) -> Result<(), Str
     while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(&app, "Скачиваем обновление лаунчера...", downloaded, total); }
     let path = launcher_data_dir()?.join("GorizontLauncher-update.exe"); fs::write(&path, bytes).map_err(|e| e.to_string())?; emit_progress(&app, "Устанавливаем обновление поверх текущей версии...", 1, Some(1));
     // NSIS updates the existing installation in place; it is never an uninstall action.
-    Command::new(&path).arg("/S").spawn().map_err(|e| format!("Не удалось запустить установщик: {e}"))?; app.exit(0); Ok(())
+    // Use detached process group so the installer survives after this launcher exits.
+    let mut cmd = Command::new(&path);
+    cmd.arg("/S");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x00000200 | 0x00000010); // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+    }
+    cmd.spawn().map_err(|e| format!("Не удалось запустить установщик: {e}"))?;
+    // Give the installer a moment to start before we exit
+    thread::sleep(Duration::from_secs(2));
+    app.exit(0); Ok(())
 }
 
 #[tauri::command]
