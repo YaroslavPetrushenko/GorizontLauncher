@@ -19,12 +19,70 @@ fn expand_windows_path(input: &str) -> PathBuf {
     PathBuf::from(value.replace('/', "\\"))
 }
 
+fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_assets(target: &Path) -> Result<(), String> {
+    // Copy libraries from default .minecraft if missing
+    let libs_dir = target.join("libraries");
+    let libs_exist = libs_dir.exists() && libs_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    if !libs_exist {
+        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_libs = default_mc.join("libraries");
+        if default_libs.exists() {
+            eprintln!("[ASSETS] Copying libraries from {}", default_libs.display());
+            copy_dir_all(&default_libs, &libs_dir).map_err(|e| format!("Не удалось скопировать библиотеки: {e}"))?;
+            eprintln!("[ASSETS] Libraries copied");
+        }
+    }
+
+    // Copy mods from default .minecraft if missing
+    let mods_dir = target.join("mods");
+    let mods_exist = mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    if !mods_exist {
+        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_mods = default_mc.join("mods");
+        if default_mods.exists() {
+            eprintln!("[ASSETS] Copying mods from {}", default_mods.display());
+            copy_dir_all(&default_mods, &mods_dir).map_err(|e| format!("Не удалось скопировать моды: {e}"))?;
+            eprintln!("[ASSETS] Mods copied");
+        }
+    }
+
+    // Copy config from default .minecraft if missing
+    let config_dir = target.join("config");
+    let config_exist = config_dir.exists() && config_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    if !config_exist {
+        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_config = default_mc.join("config");
+        if default_config.exists() {
+            eprintln!("[ASSETS] Copying config from {}", default_config.display());
+            copy_dir_all(&default_config, &config_dir).map_err(|e| format!("Не удалось скопировать конфиг: {e}"))?;
+            eprintln!("[ASSETS] Config copied");
+        }
+    }
+
+    Ok(())
+}
+
 fn launcher_data_dir() -> Result<PathBuf, String> {
     let base = env::var("LOCALAPPDATA").map_err(|_| "Не удалось определить LOCALAPPDATA".to_string())?;
     let path = PathBuf::from(base).join("GorizontLauncher"); fs::create_dir_all(&path).map_err(|e| e.to_string())?; Ok(path)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct LauncherConfig {
     github_owner: String,
     github_repo: String,
@@ -38,6 +96,18 @@ struct LauncherConfig {
     server_port: u16,
     #[serde(default)]
     local_modpack_path: Option<String>,
+}
+
+fn resolve_effective_config(config: &LauncherConfig, override_opt: &Option<VersionOverride>) -> LauncherConfig {
+    match override_opt {
+        Some(ov) => LauncherConfig {
+            minecraft_version: ov.minecraft_version.clone().unwrap_or_else(|| config.minecraft_version.clone()),
+            loader_type: ov.loader_type.clone().unwrap_or_else(|| config.loader_type.clone()),
+            loader_version: ov.loader_version.clone().unwrap_or_else(|| config.loader_version.clone()),
+            ..config.clone()
+        },
+        None => config.clone(),
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -88,8 +158,25 @@ fn launcher_config() -> Result<LauncherConfig, String> {
     serde_json::from_str(include_str!("../../launcher.config.json")).map_err(|e| format!("Ошибка launcher.config.json: {e}"))
 }
 
+#[derive(Deserialize, Debug)]
+struct VersionOverride {
+    #[serde(default)]
+    minecraft_version: Option<String>,
+    #[serde(default)]
+    loader_type: Option<String>,
+    #[serde(default)]
+    loader_version: Option<String>,
+}
+
+fn resolve_version_id(config: &LauncherConfig, override_opt: &Option<VersionOverride>) -> String {
+    let mc = override_opt.as_ref().and_then(|o| o.minecraft_version.as_deref()).unwrap_or(&config.minecraft_version);
+    let lt = override_opt.as_ref().and_then(|o| o.loader_type.as_deref()).unwrap_or(&config.loader_type);
+    let lv = override_opt.as_ref().and_then(|o| o.loader_version.as_deref()).unwrap_or(&config.loader_version);
+    format!("{}-{}-{}", mc, lt, lv)
+}
+
 fn version_id(config: &LauncherConfig) -> String {
-    format!("{}-{}-{}", config.minecraft_version, config.loader_type, config.loader_version)
+    resolve_version_id(config, &None)
 }
 
 fn releases_api_url(config: &LauncherConfig) -> String {
@@ -193,7 +280,7 @@ async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn check_and_update_modpack(app: AppHandle, local_version: String, target_dir: String) -> Result<String, String> {
+async fn check_and_update_modpack(app: AppHandle, local_version: String, target_dir: String, version_override: Option<String>) -> Result<String, String> {
     let log_file = std::env::temp_dir().join("gorizont_launcher.log");
     let log = |msg: &str| {
         let _ = fs::OpenOptions::new().create(true).append(true).open(&log_file).and_then(|mut f| f.write_all(format!("[{}] {}\n", chrono::Local::now().format("%H:%M:%S%.3f"), msg).as_bytes()));
@@ -202,30 +289,37 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     eprintln!("check_and_update_modpack called: local_version={}, target_dir={}", local_version, target_dir);
     std::io::stderr().flush().ok();
     let config = launcher_config()?;
-    log(&format!("config loaded: mc={}, loader={}, loader_ver={}", config.minecraft_version, config.loader_type, config.loader_version));
-    log(&format!("local_modpack_path={:?}", config.local_modpack_path));
+    let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let effective_config = resolve_effective_config(&config, &override_opt);
+    log(&format!("version_override={:?}", override_opt));
+    log(&format!("effective config: mc={}, loader={}, loader_ver={}", effective_config.minecraft_version, effective_config.loader_type, effective_config.loader_version));
+    log(&format!("local_modpack_path={:?}", effective_config.local_modpack_path));
     let target = expand_windows_path(&target_dir);
     log(&format!("target_dir expanded={:?}", target));
     let marker = target.join(".gorizont-installed.json");
     log(&format!("marker={:?}, exists={}", marker, marker.exists()));
     
-    let version_id = version_id(&config);
+    let version_id = resolve_version_id(&config, &override_opt);
     let profile_dir = target.join("versions").join(&version_id);
     let jar_exists = profile_dir.join(format!("{}.jar", version_id)).exists();
     let json_exists = profile_dir.join(format!("{}.json", version_id)).exists();
+    let libs_dir = target.join("libraries");
+    let libs_exist = libs_dir.exists() && libs_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    let mods_dir = target.join("mods");
+    let mods_exist = mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
     
     // FIRST: Check if already installed with valid marker and correct version folder
     if let Ok(text) = fs::read_to_string(&marker) {
         log(&format!("marker read, installed version={:?}", text));
         if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
             log(&format!("manifest parsed: pack_version={}", installed.pack_version));
-            if validate_manifest(&installed, &config).is_ok() {
+            if validate_manifest(&installed, &effective_config).is_ok() {
                 log("manifest validation passed");
-                if jar_exists && json_exists {
-                    log("jar and json exist, returning installed version");
+                if jar_exists && json_exists && libs_exist {
+                    log("jar, json and libraries exist, returning installed version");
                     return Ok(installed.pack_version);
                 } else {
-                    log(&format!("jar_exists={}, json_exists={}, profile_dir={:?}", jar_exists, json_exists, profile_dir));
+                    log(&format!("jar_exists={}, json_exists={}, libs_exist={}, mods_exist={}, profile_dir={:?}", jar_exists, json_exists, libs_exist, mods_exist, profile_dir));
                 }
             } else {
                 log("manifest validation FAILED");
@@ -236,11 +330,11 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     }
     
     // SECOND: If local_modpack_path is configured, use it as primary source
-    if let Some(local_path) = &config.local_modpack_path {
+    if let Some(local_path) = &effective_config.local_modpack_path {
         let local_path = expand_windows_path(local_path);
         if local_path.exists() {
             log("Using local modpack as primary source");
-            if !marker.exists() || !jar_exists || !json_exists {
+            if !marker.exists() || !jar_exists || !json_exists || !libs_exist || !mods_exist {
                 log("Installing from local modpack...");
                 let bytes = fs::read(&local_path).map_err(|e| format!("Не удалось прочитать локальный модпак: {e}"))?;
                 log(&format!("Read modpack zip: {} bytes", bytes.len()));
@@ -249,7 +343,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                 log(&format!("Zip archive opened, {} files", archive.len()));
                 log("safe_extract bypassed - reading manifest directly from zip...");
                 // Read manifest.json directly from zip
-                let manifest_name = config.expected_manifest.clone();
+                let manifest_name = effective_config.expected_manifest.clone();
                 let mut manifest_text = String::new();
                 let mut manifest_found = false;
                 for i in 0..archive.len() {
@@ -282,7 +376,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                         return Err(format!("Некорректный manifest.json: {}", e));
                     }
                 };
-                validate_manifest(&manifest, &config)?;
+                validate_manifest(&manifest, &effective_config)?;
                 log("manifest validation passed");
                 
                 // Extract all files from zip
@@ -305,6 +399,11 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                     io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
                 }
                 log("All files extracted");
+                
+                // Ensure libraries, mods and config exist (copy from default .minecraft if missing)
+                if let Err(e) = ensure_assets(&target) {
+                    log(&format!("Warning: {}", e));
+                }
                 
                 // Fix: modpack.zip contains old folder name "Create(VOID)", rename to expected version_id
                 let old_profile_dir = target.join("versions").join("Create(VOID)");
@@ -347,12 +446,12 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     
     // THIRD: Fallback to GitHub releases (only if no local modpack configured)
     let client = reqwest::Client::new();
-    if let Ok(response) = client.get(releases_api_url(&config)).header("User-Agent", "GorizontLauncher/0.1").send().await {
+    if let Ok(response) = client.get(releases_api_url(&effective_config)).header("User-Agent", "GorizontLauncher/0.1").send().await {
         if let Ok(response) = response.error_for_status() {
             if let Ok(releases) = response.json::<Vec<Release>>().await {
-                if let Some(release) = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == config.modpack_asset)) {
+                if let Some(release) = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == effective_config.modpack_asset)) {
                     let latest = release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string();
-                    let asset_url = release.assets.iter().find(|a| a.name == config.modpack_asset).map(|a| a.browser_download_url.clone());
+                    let asset_url = release.assets.iter().find(|a| a.name == effective_config.modpack_asset).map(|a| a.browser_download_url.clone());
                     log(&format!("GitHub fallback: latest={}, local_version={}", latest, local_version));
                     if let Some(asset_url) = asset_url {
                         if latest != local_version.trim_start_matches('v') || !marker.exists() || !jar_exists || !json_exists {
@@ -372,28 +471,32 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
 }
 
 #[tauri::command]
-async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>) -> Result<(), String> {
+async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>, version_override: Option<String>) -> Result<(), String> {
     eprintln!("[LAUNCH] launch_minecraft called: username={}, ram_mb={}, game_dir={}", username, ram_mb, game_dir);
     if username.trim().is_empty() { return Err("Введите ник".into()); }
     let ram = ram_mb.clamp(2048, 8192); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
     eprintln!("[LAUNCH] java path: {:?}", java);
-    let game_path = expand_windows_path(&game_dir); let config = launcher_config()?; let version_id = version_id(&config);
+    let config = launcher_config()?;
+    let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let effective_config = resolve_effective_config(&config, &override_opt);
+    let version_id = resolve_version_id(&config, &override_opt);
+    let game_path = expand_windows_path(&game_dir);
     eprintln!("[LAUNCH] game_path={:?}, version_id={}", game_path, version_id);
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
     eprintln!("[LAUNCH] jar path: {:?}, exists={}", jar, jar.exists());
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
-    let server = format!("{}:{}", config.server_address, config.server_port);
+    let server = format!("{}:{}", effective_config.server_address, effective_config.server_port);
     let profile_text = fs::read_to_string(game_path.join("versions").join(&version_id).join(format!("{version_id}.json"))).map_err(|e| format!("Не найден профиль Minecraft {version_id}: {e}"))?;
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
     let libraries = profile.libraries.unwrap_or_default().into_iter().filter_map(|library| library.artifact.map(|a| game_path.join(a.path))).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
     let classpath = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).collect::<Vec<_>>().join(";");
-    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", config.minecraft_version.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", effective_config.minecraft_version.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
     let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
     let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{ram}M")];
     if let Some(jvm) = jvm { args.extend(profile_values(&jvm, &replacements)); }
     args.extend(["-cp".into(), classpath, profile.main_class.unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into())]);
     if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
-    args.extend(["--server".into(), config.server_address, "--port".into(), config.server_port.to_string()]);
+    args.extend(["--server".into(), effective_config.server_address.clone(), "--port".into(), effective_config.server_port.to_string()]);
     eprintln!("[LAUNCH] spawning java with args: {:?}", args);
     Command::new(java).args(args).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; 
     eprintln!("[LAUNCH] Java spawned successfully");
