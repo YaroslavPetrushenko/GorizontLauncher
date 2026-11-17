@@ -5,7 +5,5 @@ export type Settings = {
   gameDir: string;
   localVersion: string;
   lang?: Lang;
-  minecraftVersion?: string;
-  loaderType?: string;
-  loaderVersion?: string;
+  ramAuto?: boolean;
 };

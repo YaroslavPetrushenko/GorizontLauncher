@@ -11,11 +11,12 @@ import SettingsPanel from './components/Settings';
 import News, { ServerCard, useServerStatus } from './components/News';
 import { clearAccount, loadAccount, saveAccount, type Account } from './account';
 import { detectLang, makeT, type Lang } from './i18n';
+import { effectiveRam, type SystemMemory } from './ram';
 import type { DownloadProgress, Settings } from './types';
 
 type LauncherUpdate = { version: string; url: string; size: number };
 
-const defaults: Settings = { ram: 4096, gameDir: '%APPDATA%/.GorizontLauncher', localVersion: '0.0.0' };
+const defaults: Settings = { ram: 4096, ramAuto: true, gameDir: '%APPDATA%/.GorizontLauncher', localVersion: '0.0.0' };
 const SETTINGS_KEY = 'gorizont-settings';
 
 export default function App() {
@@ -27,12 +28,14 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [busy, setBusy] = useState(false);
   const [version, setVersion] = useState('1.0.12');
+  const [memory, setMemory] = useState<SystemMemory | null>(null);
 
   const lang: Lang = settings.lang ?? detectLang();
   const t = useMemo(() => makeT(lang), [lang]);
   const server = useServerStatus();
 
   useEffect(() => {
+    invoke<SystemMemory>('get_system_memory').then(setMemory).catch(() => undefined);
     getVersion().then(setVersion).catch(() => undefined);
     invoke<LauncherUpdate | null>('check_launcher_update').then(update => { if (update) setLauncherUpdate(update); }).catch(() => undefined);
     const unlisten = listen<DownloadProgress>('download-progress', e => { setProgress(e.payload); setStatus(e.payload.stage); });
@@ -47,11 +50,10 @@ export default function App() {
     if (!account || busy) return;
     setBusy(true); setStatus(t('checkingUpdates'));
     try {
-      const versionOverride = JSON.stringify({ minecraftVersion: settings.minecraftVersion, loaderType: settings.loaderType, loaderVersion: settings.loaderVersion });
-      const installedVersion = await invoke<string>('check_and_update_modpack', { localVersion: settings.localVersion, targetDir: settings.gameDir, versionOverride });
+      const installedVersion = await invoke<string>('check_and_update_modpack', { localVersion: settings.localVersion, targetDir: settings.gameDir, });
       if (installedVersion !== settings.localVersion) persistSettings({ ...settings, localVersion: installedVersion });
       setStatus(t('launching'));
-      await invoke('launch_minecraft', { username: account.username, ramMb: settings.ram, gameDir: settings.gameDir, versionOverride });
+      await invoke('launch_minecraft', { username: account.username, ramMb: effectiveRam(settings, memory), gameDir: settings.gameDir});
       invoke('link_ip_to_account', { username: account.username }).catch(() => undefined);
       setStatus(t('gameStarted'));
     } catch (e) { setStatus(String(e)); } finally { setBusy(false); }
@@ -95,7 +97,7 @@ export default function App() {
       </main>}
 
     <footer><span>GORIZONT LAUNCHER <b>v{version}</b></span><span><Download size={14} /> {t('autoUpdate')}</span></footer>
-    {showSettings && account && <SettingsPanel t={t} lang={lang} settings={settings} username={account.username} onSave={persistSettings} onLogout={logout} onClose={() => setShowSettings(false)} />}
+    {showSettings && account && <SettingsPanel memory={memory} t={t} lang={lang} settings={settings} username={account.username} onSave={persistSettings} onLogout={logout} onClose={() => setShowSettings(false)} />}
     {progress && busy && <UpdateOverlay t={t} progress={progress} />}
     {launcherUpdate && !busy && <LauncherUpdateBanner t={t} update={launcherUpdate} onClose={() => setLauncherUpdate(null)} onInstall={installLauncherUpdate} />}
   </div>;
