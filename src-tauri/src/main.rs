@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{env, fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::Command};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use zip::ZipArchive;
 
 const VERSION_ID: &str = "1.21.1-neoforge";
@@ -45,6 +45,17 @@ fn ensure_assets(target: &Path) -> Result<(), String> {
             eprintln!("[ASSETS] Copying libraries from {}", default_libs.display());
             copy_dir_all(&default_libs, &libs_dir).map_err(|e| format!("Не удалось скопировать библиотеки: {e}"))?;
             eprintln!("[ASSETS] Libraries copied");
+        }
+    }
+
+    // Copy assets (indexes/objects) from default .minecraft if missing
+    let assets_dir = target.join("assets");
+    if !assets_dir.join("indexes").exists() {
+        let default_assets = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft").join("assets")).unwrap_or_default();
+        if default_assets.exists() {
+            eprintln!("[ASSETS] Copying assets from {}", default_assets.display());
+            copy_dir_all(&default_assets, &assets_dir).map_err(|e| format!("Не удалось скопировать assets: {e}"))?;
+            eprintln!("[ASSETS] Assets copied");
         }
     }
 
@@ -121,7 +132,9 @@ struct PackManifest {
 
 #[derive(Deserialize)]
 struct VersionProfile {
+    #[serde(rename = "mainClass")]
     main_class: Option<String>,
+    assets: Option<String>,
     arguments: Option<LaunchArguments>,
     libraries: Option<Vec<LibraryEntry>>,
 }
@@ -134,6 +147,8 @@ fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)])
         if let Some(text) = value.as_str() { return vec![text.to_string()]; }
         // Ignore arguments explicitly restricted to another operating system (for example macOS-only JVM flags).
         if let Some(rules) = value.get("rules").and_then(|rules| rules.as_array()) {
+            // Feature-gated arguments (--demo, custom resolution, quick play) must not be passed unconditionally.
+            if rules.iter().any(|rule| rule.get("features").is_some()) { return Vec::new(); }
             let allowed_for_windows = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name == "windows").unwrap_or(true));
             let restricted_elsewhere = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name != "windows").unwrap_or(false));
             if restricted_elsewhere && !allowed_for_windows { return Vec::new(); }
@@ -143,7 +158,7 @@ fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)])
 }
 
 #[derive(Deserialize)]
-struct LibraryEntry { artifact: Option<LibraryArtifact> }
+struct LibraryEntry { artifact: Option<LibraryArtifact>, name: Option<String>, rules: Option<Vec<serde_json::Value>> }
 
 #[derive(Deserialize)]
 struct LibraryArtifact { path: String }
@@ -474,6 +489,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
 async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>, version_override: Option<String>) -> Result<(), String> {
     eprintln!("[LAUNCH] launch_minecraft called: username={}, ram_mb={}, game_dir={}", username, ram_mb, game_dir);
     if username.trim().is_empty() { return Err("Введите ник".into()); }
+    if let Err(e) = ensure_assets(&expand_windows_path(&game_dir)) { eprintln!("[LAUNCH] ensure_assets failed: {e}"); }
     let ram = ram_mb.clamp(2048, 8192); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
     eprintln!("[LAUNCH] java path: {:?}", java);
     let config = launcher_config()?;
@@ -488,9 +504,21 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let server = format!("{}:{}", effective_config.server_address, effective_config.server_port);
     let profile_text = fs::read_to_string(game_path.join("versions").join(&version_id).join(format!("{version_id}.json"))).map_err(|e| format!("Не найден профиль Minecraft {version_id}: {e}"))?;
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
-    let libraries = profile.libraries.unwrap_or_default().into_iter().filter_map(|library| library.artifact.map(|a| game_path.join(a.path))).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
+    let libraries = profile.libraries.unwrap_or_default().into_iter().filter(|library| {
+        // Skip libraries restricted to other operating systems/architectures.
+        if let Some(name) = &library.name { if name.ends_with("natives-windows-arm64") || name.ends_with("natives-windows-x86") { return false; } }
+        match &library.rules {
+            Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
+            None => true,
+        }
+    }).filter_map(|library| library.artifact.map(|a| {
+        // Some profiles (TLauncher) store paths with a "libraries/" prefix, others without it.
+        let direct = game_path.join(&a.path);
+        if direct.exists() { direct } else { game_path.join("libraries").join(&a.path) }
+    })).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
+    let assets_index = profile.assets.clone().unwrap_or_else(|| config.minecraft_version.clone());
     let classpath = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).collect::<Vec<_>>().join(";");
-    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", effective_config.minecraft_version.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", assets_index.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
     let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
     let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{ram}M")];
     if let Some(jvm) = jvm { args.extend(profile_values(&jvm, &replacements)); }
@@ -498,8 +526,20 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
     args.extend(["--server".into(), effective_config.server_address.clone(), "--port".into(), effective_config.server_port.to_string()]);
     eprintln!("[LAUNCH] spawning java with args: {:?}", args);
-    Command::new(java).args(args).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; 
+    let java_log_path = game_path.join("launcher-java.log");
+    let java_log = fs::File::create(&java_log_path).map_err(|e| format!("Не удалось создать лог Java: {e}"))?;
+    let java_err = java_log.try_clone().map_err(|e| e.to_string())?;
+    let mut child = Command::new(java).args(args).current_dir(&game_path).env("GORIZONT_SERVER", server).stdout(std::process::Stdio::from(java_log)).stderr(std::process::Stdio::from(java_err)).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; 
     eprintln!("[LAUNCH] Java spawned successfully");
+    // Hide the launcher while Minecraft is running and bring it back when the game exits.
+    let window = app.get_webview_window("main");
+    if let Some(w) = &window { let _ = w.hide(); }
+    std::thread::spawn(move || {
+        let status = child.wait();
+        eprintln!("[LAUNCH] Minecraft exited: {:?}", status);
+        if let Some(w) = window { let _ = w.show(); let _ = w.unminimize(); let _ = w.set_focus(); }
+        let _ = app.emit("minecraft-exited", ());
+    });
     Ok(())
 }
 
