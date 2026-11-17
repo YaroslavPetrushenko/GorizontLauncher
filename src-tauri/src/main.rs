@@ -155,12 +155,16 @@ fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)])
             let restricted_elsewhere = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name != "windows").unwrap_or(false));
             if restricted_elsewhere && !allowed_for_windows { return Vec::new(); }
         }
+        if let Some(text) = value.get("value").and_then(|v| v.as_str()) { return vec![text.to_string()]; }
         value.get("values").and_then(|items| items.as_array()).map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect()).unwrap_or_default()
     }).map(|value| replacements.iter().fold(value, |text, (key, replacement)| text.replace(key, replacement))).collect()
 }
 
 #[derive(Deserialize)]
-struct LibraryEntry { artifact: Option<LibraryArtifact>, name: Option<String>, rules: Option<Vec<serde_json::Value>> }
+struct LibraryEntry { artifact: Option<LibraryArtifact>, downloads: Option<LibraryDownloads>, name: Option<String>, rules: Option<Vec<serde_json::Value>> }
+
+#[derive(Deserialize)]
+struct LibraryDownloads { artifact: Option<LibraryArtifact> }
 
 #[derive(Deserialize)]
 struct LibraryArtifact { path: String }
@@ -215,8 +219,8 @@ fn version_newer(candidate: &str, current: &str) -> bool {
 fn validate_manifest(manifest: &PackManifest, config: &LauncherConfig) -> Result<(), String> {
     if manifest.schema_version != 1 { return Err(format!("Неподдерживаемая версия manifest.json: {}", manifest.schema_version)); }
     if manifest.pack_id != config.pack_id { return Err(format!("Неверная сборка: ожидался pack_id {}, получен {}", config.pack_id, manifest.pack_id)); }
-    if manifest.minecraft_version != config.minecraft_version { return Err(format!("Сборка рассчитана на Minecraft {}, а нужен {}", manifest.minecraft_version, config.minecraft_version)); }
-    if manifest.loader.r#type != config.loader_type || manifest.loader.version != config.loader_version { return Err(format!("Неверный загрузчик: нужен {} {}, а в сборке {} {}", config.loader_type, config.loader_version, manifest.loader.r#type, manifest.loader.version)); }
+    if manifest.minecraft_version.trim().is_empty() || manifest.loader.r#type.trim().is_empty() || manifest.loader.version.trim().is_empty() { return Err("В manifest.json не указан Minecraft или загрузчик".into()); }
+    let _ = config;
     if manifest.pack_version.trim().is_empty() { return Err("В manifest.json отсутствует pack_version".into()); }
     Ok(())
 }
@@ -323,6 +327,15 @@ async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
     let java_candidate = fs::read_dir(&temp).map_err(|e| e.to_string())?.filter_map(Result::ok).map(|e| e.path().join("bin").join("javaw.exe")).find(|p| p.exists()).ok_or_else(|| "В скачанном архиве Java не найден javaw.exe".to_string())?; if root.exists() { fs::remove_dir_all(&root).map_err(|e| e.to_string())?; } fs::rename(&temp, &root).map_err(|e| e.to_string())?; let _ = fs::remove_file(archive_path); Ok(root.join(java_candidate.strip_prefix(&temp).unwrap_or(Path::new("bin\\javaw.exe"))))
 }
 
+/// Latest published modpack version on GitHub (None when offline or no release has the pack asset).
+async fn latest_pack_version(config: &LauncherConfig) -> Option<String> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok()?;
+    let response = client.get(releases_api_url(config)).header("User-Agent", "GorizontLauncher/1.0").send().await.ok()?.error_for_status().ok()?;
+    let releases = response.json::<Vec<Release>>().await.ok()?;
+    let release = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == config.modpack_asset))?;
+    Some(release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string())
+}
+
 #[tauri::command]
 async fn check_and_update_modpack(app: AppHandle, local_version: String, target_dir: String, version_override: Option<String>) -> Result<String, String> {
     let log_file = std::env::temp_dir().join("gorizont_launcher.log");
@@ -343,7 +356,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     let marker = target.join(".gorizont-installed.json");
     log(&format!("marker={:?}, exists={}", marker, marker.exists()));
     
-    let version_id = resolve_version_id(&config, &override_opt);
+    let version_id = pack_version_id(&target, &config);
     let profile_dir = target.join("versions").join(&version_id);
     let jar_exists = profile_dir.join(format!("{}.jar", version_id)).exists();
     let json_exists = profile_dir.join(format!("{}.json", version_id)).exists();
@@ -352,6 +365,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     let mods_dir = target.join("mods");
     let mods_exist = mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
     
+    let mut force_update = false;
     // FIRST: Check if already installed with valid marker and correct version folder
     if let Ok(text) = fs::read_to_string(&marker) {
         log(&format!("marker read, installed version={:?}", text));
@@ -359,11 +373,11 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
             log(&format!("manifest parsed: pack_version={}", installed.pack_version));
             if validate_manifest(&installed, &effective_config).is_ok() {
                 log("manifest validation passed");
-                if jar_exists && json_exists && libs_exist {
-                    log("jar, json and libraries exist, returning installed version");
-                    return Ok(installed.pack_version);
-                } else {
-                    log(&format!("jar_exists={}, json_exists={}, libs_exist={}, mods_exist={}, profile_dir={:?}", jar_exists, json_exists, libs_exist, mods_exist, profile_dir));
+                {
+                    match latest_pack_version(&effective_config).await {
+                        Some(latest) if version_newer(&latest, &installed.pack_version) => { log(&format!("newer pack on GitHub: {} > {}", latest, installed.pack_version)); force_update = true; }
+                        _ => { log("jar, json and libraries exist and pack is up to date"); return Ok(installed.pack_version); }
+                    }
                 }
             } else {
                 log("manifest validation FAILED");
@@ -498,7 +512,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                     let asset_url = release.assets.iter().find(|a| a.name == effective_config.modpack_asset).map(|a| a.browser_download_url.clone());
                     log(&format!("GitHub fallback: latest={}, local_version={}", latest, local_version));
                     if let Some(asset_url) = asset_url {
-                        if latest != local_version.trim_start_matches('v') || !marker.exists() || !jar_exists || !json_exists {
+                        if force_update || latest != local_version.trim_start_matches('v') || !marker.exists() {
                             log("Downloading from GitHub...");
                             download_and_extract_modpack(app, asset_url, target_dir, None).await?;
                             return Ok(latest);
@@ -609,6 +623,92 @@ async fn ensure_game_files(app: &AppHandle, game_path: &Path, version_id: &str) 
     Ok(())
 }
 
+struct LoaderInfo { mc: String, kind: String, version: String }
+
+/// Loader described by the installed pack's manifest (falls back to launcher.config.json before the first install).
+fn read_installed_loader(game_path: &Path, config: &LauncherConfig) -> LoaderInfo {
+    if let Ok(text) = fs::read_to_string(game_path.join(".gorizont-installed.json")) {
+        if let Ok(m) = serde_json::from_str::<PackManifest>(&text) { return LoaderInfo { mc: m.minecraft_version, kind: m.loader.r#type, version: m.loader.version }; }
+    }
+    LoaderInfo { mc: config.minecraft_version.clone(), kind: config.loader_type.clone(), version: config.loader_version.clone() }
+}
+fn loader_version_id(l: &LoaderInfo) -> String { format!("{}-{}-{}", l.mc, l.kind, l.version) }
+fn pack_version_id(game_path: &Path, config: &LauncherConfig) -> String { loader_version_id(&read_installed_loader(game_path, config)) }
+
+/// Full NeoForge version for a manifest value: "266" + Minecraft 1.21.1 -> "21.1.266"; values with dots are used as is.
+fn neoforge_full_version(l: &LoaderInfo) -> String {
+    if l.version.contains('.') { return l.version.clone(); }
+    let parts: Vec<&str> = l.mc.split('.').collect();
+    format!("{}.{}.{}", parts.get(1).unwrap_or(&"0"), parts.get(2).unwrap_or(&"0"), l.version)
+}
+
+/// Installs the loader named in the pack manifest (NeoForge via its official installer) and writes a
+/// self-contained version profile `versions/<mc>-<loader>-<version>/`.
+async fn ensure_loader(app: &AppHandle, game_path: &Path, info: &LoaderInfo) -> Result<(), String> {
+    let version_id = loader_version_id(info);
+    let dir = game_path.join("versions").join(&version_id);
+    let json_path = dir.join(format!("{version_id}.json"));
+    let jar_path = dir.join(format!("{version_id}.jar"));
+    if json_path.exists() && jar_path.exists() { return Ok(()); }
+    if info.kind != "neoforge" { return Err(format!("Загрузчик «{}» пока не поддерживается лаунчером", info.kind)); }
+    let full = neoforge_full_version(info);
+    let log_path = game_path.join("launcher-loader.log");
+    let client = reqwest::Client::new();
+
+    let installer = launcher_data_dir()?.join("loaders").join(format!("neoforge-{full}-installer.jar"));
+    if !installer.exists() {
+        emit_progress(app, "Скачивание загрузчика NeoForge...", 0, None);
+        let url = format!("https://maven.neoforged.net/releases/net/neoforged/neoforge/{full}/neoforge-{full}-installer.jar");
+        fetch_to(&client, &[url], &installer).await.map_err(|e| format!("Не удалось скачать NeoForge {full}: {e}"))?;
+    }
+
+    emit_progress(app, "Установка загрузчика NeoForge (может занять несколько минут)...", 0, None);
+    fs::create_dir_all(game_path).map_err(|e| e.to_string())?;
+    let profiles = game_path.join("launcher_profiles.json");
+    if !profiles.exists() { fs::write(&profiles, "{\"profiles\":{},\"version\":3}").map_err(|e| e.to_string())?; }
+    let javaw = ensure_java(app).await?;
+    let java = { let exe = javaw.with_file_name("java.exe"); if exe.exists() { exe } else { javaw } };
+    let (installer_c, game_c, log_c) = (installer.clone(), game_path.to_path_buf(), log_path.clone());
+    let status = tauri::async_runtime::spawn_blocking(move || {
+        let log_file = fs::File::create(&log_c).map_err(|e| e.to_string())?;
+        let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
+        let mut cmd = Command::new(java);
+        cmd.arg("-jar").arg(&installer_c).arg("--installClient").arg(&game_c).stdout(std::process::Stdio::from(log_file)).stderr(std::process::Stdio::from(log_err));
+        #[cfg(windows)]
+        { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
+        cmd.status().map_err(|e| format!("Не удалось запустить установщик NeoForge: {e}"))
+    }).await.map_err(|e| e.to_string())??;
+    if !status.success() {
+        let tail = fs::read_to_string(&log_path).unwrap_or_default().lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(format!("Установщик NeoForge завершился с ошибкой. Подробности в launcher-loader.log\n{tail}"));
+    }
+
+    // Merge the NeoForge profile with its vanilla parent into one standalone profile.
+    let neo_id = format!("neoforge-{full}");
+    let child: serde_json::Value = serde_json::from_str(&fs::read_to_string(game_path.join("versions").join(&neo_id).join(format!("{neo_id}.json"))).map_err(|e| format!("Профиль NeoForge не найден после установки: {e}"))?).map_err(|e| e.to_string())?;
+    let parent_id = child.get("inheritsFrom").and_then(|v| v.as_str()).unwrap_or(&info.mc).to_string();
+    let parent: serde_json::Value = serde_json::from_str(&fs::read_to_string(game_path.join("versions").join(&parent_id).join(format!("{parent_id}.json"))).map_err(|e| format!("Профиль Minecraft {parent_id} не найден: {e}"))?).map_err(|e| e.to_string())?;
+    let mut merged = parent.clone();
+    let mut seen = std::collections::HashSet::new();
+    let mut libs = Vec::new();
+    for lib in child.get("libraries").and_then(|l| l.as_array()).into_iter().flatten().chain(parent.get("libraries").and_then(|l| l.as_array()).into_iter().flatten()) {
+        let key = lib.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+        if key.is_empty() || seen.insert(key) { libs.push(lib.clone()); }
+    }
+    merged["libraries"] = serde_json::Value::Array(libs);
+    let arg_list = |v: &serde_json::Value, k: &str| -> Vec<serde_json::Value> { v.get("arguments").and_then(|a| a.get(k)).and_then(|a| a.as_array()).cloned().unwrap_or_default() };
+    let jvm: Vec<_> = arg_list(&parent, "jvm").into_iter().chain(arg_list(&child, "jvm")).collect();
+    let game: Vec<_> = arg_list(&parent, "game").into_iter().chain(arg_list(&child, "game")).collect();
+    merged["arguments"] = serde_json::json!({ "jvm": jvm, "game": game });
+    if let Some(main) = child.get("mainClass") { merged["mainClass"] = main.clone(); }
+    if let Some(obj) = merged.as_object_mut() { obj.remove("inheritsFrom"); }
+    merged["id"] = serde_json::Value::String(version_id.clone());
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(&json_path, serde_json::to_vec_pretty(&merged).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    fs::copy(game_path.join("versions").join(&parent_id).join(format!("{parent_id}.jar")), &jar_path).map_err(|e| format!("Не удалось подготовить клиент Minecraft: {e}"))?;
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemMemory { total_mb: u64, available_mb: u64 }
@@ -639,6 +739,19 @@ fn clamp_ram_mb(requested: u32) -> u32 {
 fn get_system_memory() -> Result<SystemMemory, String> { read_system_memory().ok_or_else(|| "Не удалось определить объём ОЗУ".to_string()) }
 
 #[tauri::command]
+async fn prepare_game_files(app: AppHandle, game_dir: String, version_override: Option<String>) -> Result<(), String> {
+    let config = launcher_config()?;
+    let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let _ = override_opt;
+    let game_path = expand_windows_path(&game_dir);
+    let loader = read_installed_loader(&game_path, &config);
+    let version_id = loader_version_id(&loader);
+    if let Err(e) = ensure_assets(&game_path) { eprintln!("[PREPARE] ensure_assets failed: {e}"); }
+    ensure_loader(&app, &game_path, &loader).await?;
+    ensure_game_files(&app, &game_path, &version_id).await
+}
+
+#[tauri::command]
 async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>, version_override: Option<String>) -> Result<(), String> {
     eprintln!("[LAUNCH] launch_minecraft called: username={}, ram_mb={}, game_dir={}", username, ram_mb, game_dir);
     if username.trim().is_empty() { return Err("Введите ник".into()); }
@@ -648,8 +761,8 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let config = launcher_config()?;
     let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
     let effective_config = resolve_effective_config(&config, &override_opt);
-    let version_id = resolve_version_id(&config, &override_opt);
     let game_path = expand_windows_path(&game_dir);
+    let version_id = pack_version_id(&game_path, &config);
     eprintln!("[LAUNCH] game_path={:?}, version_id={}", game_path, version_id);
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
     eprintln!("[LAUNCH] jar path: {:?}, exists={}", jar, jar.exists());
@@ -664,7 +777,7 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
             Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
             None => true,
         }
-    }).filter_map(|library| library.artifact.map(|a| {
+    }).filter_map(|library| library.artifact.or(library.downloads.and_then(|d| d.artifact)).map(|a| {
         // Some profiles (TLauncher) store paths with a "libraries/" prefix, others without it.
         let direct = game_path.join(&a.path);
         if direct.exists() { direct } else { game_path.join("libraries").join(&a.path) }
@@ -722,5 +835,5 @@ async fn link_ip_to_account(username: String) -> Result<(), String> {
 fn main() { 
     eprintln!("[MAIN] Starting Gorizont Launcher");
     std::io::stderr().flush().ok();
-    tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![get_system_memory, lookup_mojang_profile, download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
+    tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![get_system_memory, prepare_game_files, lookup_mojang_profile, download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
 }

@@ -44,3 +44,4 @@ footer{height:44px;display:flex;align-items:center;justify-content:space-between
 .app-shell>.content{grid-template-rows:minmax(0,1fr);overflow:hidden}
 .app-shell>.content .news{height:100%;overflow-y:auto}
 .app-shell>footer{position:relative;bottom:auto;left:auto;right:auto}
+.pack-line{font-size:11px;color:#71717a;margin:-4px 0 12px}.pack-line b{color:#facc15}

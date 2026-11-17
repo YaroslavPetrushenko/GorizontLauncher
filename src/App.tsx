@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
@@ -46,18 +46,39 @@ export default function App() {
   const persistSettings = (next: Settings) => { setSettings(next); try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch { /* ignore */ } };
   const logout = () => { clearAccount(); setAccount(null); setShowSettings(false); setStatus(null); };
 
+  // Checks the modpack release, installs/updates it and downloads missing libraries and assets.
+  const prepare = async (): Promise<boolean> => {
+    setStatus(t('checkingUpdates'));
+    try {
+      const installedVersion = await invoke<string>('check_and_update_modpack', { localVersion: settings.localVersion, targetDir: settings.gameDir });
+      if (installedVersion !== settings.localVersion) persistSettings({ ...settings, localVersion: installedVersion });
+      await invoke('prepare_game_files', { gameDir: settings.gameDir });
+      setProgress(null); setStatus(t('ready'));
+      return true;
+    } catch (e) { setProgress(null); setStatus(String(e)); return false; }
+  };
+
   const play = async () => {
     if (!account || busy) return;
-    setBusy(true); setStatus(t('checkingUpdates'));
+    setBusy(true);
     try {
-      const installedVersion = await invoke<string>('check_and_update_modpack', { localVersion: settings.localVersion, targetDir: settings.gameDir, });
-      if (installedVersion !== settings.localVersion) persistSettings({ ...settings, localVersion: installedVersion });
+      if (!(await prepare())) return;
       setStatus(t('launching'));
-      await invoke('launch_minecraft', { username: account.username, ramMb: effectiveRam(settings, memory), gameDir: settings.gameDir});
+      await invoke('launch_minecraft', { username: account.username, ramMb: effectiveRam(settings, memory), gameDir: settings.gameDir });
       invoke('link_ip_to_account', { username: account.username }).catch(() => undefined);
       setStatus(t('gameStarted'));
     } catch (e) { setStatus(String(e)); } finally { setBusy(false); }
   };
+
+  // Check the modpack automatically once the launcher is opened with a saved profile.
+  const startupChecked = useRef(false);
+  useEffect(() => {
+    if (!account || startupChecked.current) return;
+    startupChecked.current = true;
+    setBusy(true);
+    prepare().finally(() => setBusy(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account]);
 
   const installLauncherUpdate = () => {
     if (!launcherUpdate) return;
@@ -86,6 +107,7 @@ export default function App() {
           <h1>{t('heroTitle1')}<br /><em>{t('heroTitle2')}</em></h1>
           <p className="hero-copy">{t('heroCopy')}</p>
           <div className="welcome-chip"><span className="avatar">{account.uuid ? <img src={`https://mc-heads.net/avatar/${account.uuid}/36`} alt="" /> : account.username.slice(0, 1).toUpperCase()}</span><div><small>{t('welcome')}</small><strong>{account.username}</strong></div></div>
+          <div className="pack-line">{t('packVersion')}: <b>{settings.localVersion === '0.0.0' ? '—' : `v${settings.localVersion}`}</b></div>
           <button className="play-button" onClick={play} disabled={busy}><Play size={21} fill="currentColor" />{busy ? t('loading') : t('play')}<span /></button>
           <ProgressBar percent={progress?.percent ?? 0} label={status ?? t('ready')} hidden={!progress && !status} />
           <div className="security-note"><ShieldCheck size={16} /> {t('authNote')}</div>
