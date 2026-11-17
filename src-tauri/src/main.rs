@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "console")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod servers;
 
@@ -599,7 +599,5 @@ async fn link_ip_to_account(username: String) -> Result<(), String> {
 fn main() { 
     eprintln!("[MAIN] Starting Gorizont Launcher");
     std::io::stderr().flush().ok();
-    // Test file write
-    let _ = std::fs::write("C:\\test_launcher.txt", "MAIN CALLED");
     tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![get_system_memory, lookup_mojang_profile, download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
 }
