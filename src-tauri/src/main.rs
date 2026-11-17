@@ -155,12 +155,16 @@ fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)])
             let restricted_elsewhere = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name != "windows").unwrap_or(false));
             if restricted_elsewhere && !allowed_for_windows { return Vec::new(); }
         }
+        if let Some(text) = value.get("value").and_then(|v| v.as_str()) { return vec![text.to_string()]; }
         value.get("values").and_then(|items| items.as_array()).map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect()).unwrap_or_default()
     }).map(|value| replacements.iter().fold(value, |text, (key, replacement)| text.replace(key, replacement))).collect()
 }
 
 #[derive(Deserialize)]
-struct LibraryEntry { artifact: Option<LibraryArtifact>, name: Option<String>, rules: Option<Vec<serde_json::Value>> }
+struct LibraryEntry { artifact: Option<LibraryArtifact>, downloads: Option<LibraryDownloads>, name: Option<String>, rules: Option<Vec<serde_json::Value>> }
+
+#[derive(Deserialize)]
+struct LibraryDownloads { artifact: Option<LibraryArtifact> }
 
 #[derive(Deserialize)]
 struct LibraryArtifact { path: String }
@@ -773,7 +777,7 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
             Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
             None => true,
         }
-    }).filter_map(|library| library.artifact.map(|a| {
+    }).filter_map(|library| library.artifact.or(library.downloads.and_then(|d| d.artifact)).map(|a| {
         // Some profiles (TLauncher) store paths with a "libraries/" prefix, others without it.
         let direct = game_path.join(&a.path);
         if direct.exists() { direct } else { game_path.join("libraries").join(&a.path) }
