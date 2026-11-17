@@ -85,7 +85,7 @@ export default function App() {
           <div className="hero-kicker"><span /> {t('heroKicker')}</div>
           <h1>{t('heroTitle1')}<br /><em>{t('heroTitle2')}</em></h1>
           <p className="hero-copy">{t('heroCopy')}</p>
-          <div className="welcome-chip"><span className="avatar">{account.username.slice(0, 1).toUpperCase()}</span><div><small>{t('welcome')}</small><strong>{account.username}</strong></div></div>
+          <div className="welcome-chip"><span className="avatar">{account.uuid ? <img src={`https://mc-heads.net/avatar/${account.uuid}/36`} alt="" /> : account.username.slice(0, 1).toUpperCase()}</span><div><small>{t('welcome')}</small><strong>{account.username}</strong></div></div>
           <button className="play-button" onClick={play} disabled={busy}><Play size={21} fill="currentColor" />{busy ? t('loading') : t('play')}<span /></button>
           <ProgressBar percent={progress?.percent ?? 0} label={status ?? t('ready')} hidden={!progress && !status} />
           <div className="security-note"><ShieldCheck size={16} /> {t('authNote')}</div>

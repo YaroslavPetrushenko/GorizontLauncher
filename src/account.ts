@@ -1,4 +1,4 @@
-export type Account = { username: string; passHash: string };
+export type Account = { username: string; passHash: string; uuid?: string };
 const KEY = 'gorizont-account';
 
 export function loadAccount(): Account | null {

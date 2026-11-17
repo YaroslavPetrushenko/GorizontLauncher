@@ -28,3 +28,5 @@
 .modal::-webkit-scrollbar{width:6px}.modal::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:6px}
 .check-row{display:flex;align-items:center;gap:8px;color:#d4d4d8;font-size:12px;margin:2px 0 8px;cursor:pointer}.check-row small{color:#71717a}.check-row input{accent-color:#facc15}
 input[type=range]:disabled{opacity:.4}.range-labels{gap:8px}
+.nick-check{display:flex;align-items:center;gap:8px;font-size:11px;line-height:1.4;color:#a1a1aa}.nick-check.premium{color:#a3e635}.nick-check.error{color:#fca5a5}.nick-check img{width:20px;height:20px;border-radius:4px}
+.avatar{overflow:hidden}.avatar img{width:100%;height:100%;display:block}

@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "console")]
 
+mod servers;
+
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -555,6 +557,8 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
     args.extend(["--server".into(), effective_config.server_address.clone(), "--port".into(), effective_config.server_port.to_string()]);
     eprintln!("[LAUNCH] spawning java with args: {:?}", args);
+    // Make sure the Gorizont server is in the multiplayer list.
+    match servers::ensure_default_server(&game_path, "Gorizont", &server) { Ok(changed) => eprintln!("[LAUNCH] servers.dat updated={changed}"), Err(e) => eprintln!("[LAUNCH] servers.dat error: {e}") }
     let java_log_path = game_path.join("launcher-java.log");
     let java_log = fs::File::create(&java_log_path).map_err(|e| format!("Не удалось создать лог Java: {e}"))?;
     let java_err = java_log.try_clone().map_err(|e| e.to_string())?;
@@ -572,6 +576,20 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     Ok(())
 }
 
+#[derive(Serialize)]
+struct MojangProfile { id: String, name: String }
+
+/// Looks a nickname up in Mojang's database. Returns None when no licensed account has this name.
+#[tauri::command]
+async fn lookup_mojang_profile(username: String) -> Result<Option<MojangProfile>, String> {
+    let name = username.trim();
+    if name.len() < 3 || name.len() > 16 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return Ok(None); }
+    let response = reqwest::Client::new().get(format!("https://api.mojang.com/users/profiles/minecraft/{name}")).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND || response.status() == reqwest::StatusCode::NO_CONTENT { return Ok(None); }
+    let value: serde_json::Value = response.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    Ok(match (value.get("id").and_then(|v| v.as_str()), value.get("name").and_then(|v| v.as_str())) { (Some(id), Some(name)) => Some(MojangProfile { id: id.into(), name: name.into() }), _ => None })
+}
+
 #[tauri::command]
 async fn link_ip_to_account(username: String) -> Result<(), String> {
     if WEBHOOK_URL.is_empty() || WEBHOOK_TOKEN.is_empty() { return Err("Веб-хук не настроен в конфигурации лаунчера".into()); }
@@ -583,5 +601,5 @@ fn main() {
     std::io::stderr().flush().ok();
     // Test file write
     let _ = std::fs::write("C:\\test_launcher.txt", "MAIN CALLED");
-    tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![get_system_memory, download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
+    tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![get_system_memory, lookup_mojang_profile, download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
 }
