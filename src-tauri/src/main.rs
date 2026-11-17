@@ -1,11 +1,13 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "console")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod servers;
 
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{env, fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::Command};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use zip::ZipArchive;
 
 const VERSION_ID: &str = "1.21.1-neoforge";
@@ -45,6 +47,17 @@ fn ensure_assets(target: &Path) -> Result<(), String> {
             eprintln!("[ASSETS] Copying libraries from {}", default_libs.display());
             copy_dir_all(&default_libs, &libs_dir).map_err(|e| format!("Не удалось скопировать библиотеки: {e}"))?;
             eprintln!("[ASSETS] Libraries copied");
+        }
+    }
+
+    // Copy assets (indexes/objects) from default .minecraft if missing
+    let assets_dir = target.join("assets");
+    if !assets_dir.join("indexes").exists() {
+        let default_assets = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft").join("assets")).unwrap_or_default();
+        if default_assets.exists() {
+            eprintln!("[ASSETS] Copying assets from {}", default_assets.display());
+            copy_dir_all(&default_assets, &assets_dir).map_err(|e| format!("Не удалось скопировать assets: {e}"))?;
+            eprintln!("[ASSETS] Assets copied");
         }
     }
 
@@ -121,7 +134,9 @@ struct PackManifest {
 
 #[derive(Deserialize)]
 struct VersionProfile {
+    #[serde(rename = "mainClass")]
     main_class: Option<String>,
+    assets: Option<String>,
     arguments: Option<LaunchArguments>,
     libraries: Option<Vec<LibraryEntry>>,
 }
@@ -134,6 +149,8 @@ fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)])
         if let Some(text) = value.as_str() { return vec![text.to_string()]; }
         // Ignore arguments explicitly restricted to another operating system (for example macOS-only JVM flags).
         if let Some(rules) = value.get("rules").and_then(|rules| rules.as_array()) {
+            // Feature-gated arguments (--demo, custom resolution, quick play) must not be passed unconditionally.
+            if rules.iter().any(|rule| rule.get("features").is_some()) { return Vec::new(); }
             let allowed_for_windows = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name == "windows").unwrap_or(true));
             let restricted_elsewhere = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name != "windows").unwrap_or(false));
             if restricted_elsewhere && !allowed_for_windows { return Vec::new(); }
@@ -143,7 +160,7 @@ fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)])
 }
 
 #[derive(Deserialize)]
-struct LibraryEntry { artifact: Option<LibraryArtifact> }
+struct LibraryEntry { artifact: Option<LibraryArtifact>, name: Option<String>, rules: Option<Vec<serde_json::Value>> }
 
 #[derive(Deserialize)]
 struct LibraryArtifact { path: String }
@@ -209,6 +226,32 @@ fn emit_progress(app: &AppHandle, stage: &str, downloaded: u64, total: Option<u6
     let _ = app.emit("download-progress", DownloadProgress { downloaded, total, percent, stage: stage.to_string() });
 }
 
+/// After a modpack update, move mod jars that are no longer part of the pack into `mods-old`
+/// so old and new versions of the same mod are never loaded together.
+fn retire_stale_mods<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Path) {
+    let mut keep = std::collections::HashSet::new();
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            if let Some(name) = file.enclosed_name() {
+                if name.parent().map(|p| p == Path::new("mods")).unwrap_or(false) { if let Some(n) = name.file_name() { keep.insert(n.to_string_lossy().to_string()); } }
+            }
+        }
+    }
+    if keep.is_empty() { return; }
+    let mods_dir = target.join("mods");
+    let old_dir = target.join("mods-old");
+    if let Ok(entries) = fs::read_dir(&mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_file() && name.to_lowercase().ends_with(".jar") && !keep.contains(&name) {
+                let _ = fs::create_dir_all(&old_dir);
+                let _ = fs::rename(&path, old_dir.join(&name));
+            }
+        }
+    }
+}
+
 fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Path, config: &LauncherConfig) -> Result<PackManifest, String> {
     if archive.len() > 20_000 { return Err("Архив содержит слишком много файлов".into()); }
     let mut manifest: Option<PackManifest> = None;
@@ -227,6 +270,7 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
         io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
     }
     let manifest = manifest.ok_or_else(|| format!("В корне modpack.zip отсутствует {}", config.expected_manifest))?;
+    retire_stale_mods(archive, target);
     validate_manifest(&manifest, config)?;
     Ok(manifest)
 }
@@ -470,11 +514,136 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     Err("Не найден модпак: не настроен локальный путь и нет релиза на GitHub".into())
 }
 
+fn library_allowed(library: &serde_json::Value) -> bool {
+    if let Some(name) = library.get("name").and_then(|n| n.as_str()) { if name.ends_with("natives-windows-arm64") || name.ends_with("natives-windows-x86") { return false; } }
+    match library.get("rules").and_then(|r| r.as_array()) {
+        Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
+        None => true,
+    }
+}
+
+async fn fetch_to(client: &reqwest::Client, urls: &[String], dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let mut last = String::from("нет адресов для загрузки");
+    for url in urls {
+        match client.get(url).header("User-Agent", "GorizontLauncher/1.0").send().await.and_then(|r| r.error_for_status()) {
+            Ok(response) => match response.bytes().await {
+                Ok(bytes) => { let tmp = dest.with_extension("part"); fs::write(&tmp, &bytes).map_err(|e| e.to_string())?; fs::rename(&tmp, dest).map_err(|e| e.to_string())?; return Ok(()); }
+                Err(e) => last = format!("{url}: {e}"),
+            },
+            Err(e) => last = format!("{url}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// Downloads libraries and assets that the version profile needs but are missing on disk (fresh installs).
+async fn ensure_game_files(app: &AppHandle, game_path: &Path, version_id: &str) -> Result<(), String> {
+    let profile_path = game_path.join("versions").join(version_id).join(format!("{version_id}.json"));
+    let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(&profile_path).map_err(|e| format!("Не найден профиль Minecraft: {e}"))?).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
+    let client = reqwest::Client::new();
+
+    // Libraries
+    let mut jobs: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for library in profile.get("libraries").and_then(|l| l.as_array()).cloned().unwrap_or_default() {
+        if !library_allowed(&library) { continue; }
+        let Some(artifact) = library.get("artifact").or_else(|| library.get("downloads").and_then(|d| d.get("artifact"))) else { continue };
+        let Some(path) = artifact.get("path").and_then(|p| p.as_str()) else { continue };
+        let relative = path.trim_start_matches("libraries/");
+        let dest = game_path.join("libraries").join(relative);
+        let alt = game_path.join(path);
+        if dest.exists() || alt.exists() { continue; }
+        let mut urls = Vec::new();
+        if let Some(url) = artifact.get("url").and_then(|u| u.as_str()) { if !url.is_empty() { urls.push(url.replace("http://", "https://")); } }
+        urls.push(format!("https://libraries.minecraft.net/{relative}"));
+        urls.push(format!("https://maven.neoforged.net/releases/{relative}"));
+        urls.push(format!("https://repo1.maven.org/maven2/{relative}"));
+        jobs.push((dest, urls));
+    }
+    let total = jobs.len() as u64;
+    if total > 0 {
+        emit_progress(app, "Скачивание библиотек...", 0, Some(total));
+        let done = std::sync::atomic::AtomicU64::new(0);
+        let results: Vec<Result<(), String>> = futures_util::stream::iter(jobs).map(|(dest, urls)| { let client = client.clone(); let done = &done; async move {
+            let r = fetch_to(&client, &urls, &dest).await;
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            emit_progress(app, "Скачивание библиотек...", n, Some(total));
+            r
+        } }).buffer_unordered(8).collect().await;
+        if let Some(Err(e)) = results.into_iter().find(|r| r.is_err()) { return Err(format!("Не удалось скачать библиотеку: {e}")); }
+    }
+
+    // Assets
+    if let Some(index) = profile.get("assetIndex") {
+        let id = index.get("id").and_then(|v| v.as_str()).unwrap_or("legacy");
+        let index_path = game_path.join("assets").join("indexes").join(format!("{id}.json"));
+        if !index_path.exists() {
+            if let Some(url) = index.get("url").and_then(|u| u.as_str()) { fetch_to(&client, &[url.to_string()], &index_path).await.map_err(|e| format!("Не удалось скачать индекс ресурсов: {e}"))?; }
+        }
+        if let Ok(text) = fs::read_to_string(&index_path) {
+            if let Ok(index_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                let mut jobs: Vec<(PathBuf, Vec<String>)> = Vec::new();
+                for (_, object) in index_json.get("objects").and_then(|o| o.as_object()).cloned().unwrap_or_default() {
+                    let Some(hash) = object.get("hash").and_then(|h| h.as_str()) else { continue };
+                    if hash.len() < 2 { continue; }
+                    let dest = game_path.join("assets").join("objects").join(&hash[..2]).join(hash);
+                    if dest.exists() { continue; }
+                    jobs.push((dest, vec![format!("https://resources.download.minecraft.net/{}/{}", &hash[..2], hash)]));
+                }
+                let total = jobs.len() as u64;
+                if total > 0 {
+                    emit_progress(app, "Скачивание ресурсов игры...", 0, Some(total));
+                    let done = std::sync::atomic::AtomicU64::new(0);
+                    let results: Vec<Result<(), String>> = futures_util::stream::iter(jobs).map(|(dest, urls)| { let client = client.clone(); let done = &done; async move {
+                        let r = fetch_to(&client, &urls, &dest).await;
+                        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n % 25 == 0 || n == total { emit_progress(app, "Скачивание ресурсов игры...", n, Some(total)); }
+                        r
+                    } }).buffer_unordered(24).collect().await;
+                    let failed = results.iter().filter(|r| r.is_err()).count();
+                    if failed > 0 { eprintln!("[ASSETS] {failed} asset files failed to download"); }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemMemory { total_mb: u64, available_mb: u64 }
+
+#[repr(C)]
+struct MemoryStatusEx { length: u32, memory_load: u32, total_phys: u64, avail_phys: u64, total_page_file: u64, avail_page_file: u64, total_virtual: u64, avail_virtual: u64, avail_extended_virtual: u64 }
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" { fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32; }
+
+fn read_system_memory() -> Option<SystemMemory> {
+    #[cfg(windows)]
+    {
+        let mut status = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, memory_load: 0, total_phys: 0, avail_phys: 0, total_page_file: 0, avail_page_file: 0, total_virtual: 0, avail_virtual: 0, avail_extended_virtual: 0 };
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { return Some(SystemMemory { total_mb: status.total_phys / 1024 / 1024, available_mb: status.avail_phys / 1024 / 1024 }); }
+    }
+    None
+}
+
+/// Keep at least 2 GB for Windows and other apps; never allocate more than the PC really has.
+fn clamp_ram_mb(requested: u32) -> u32 {
+    let max = read_system_memory().map(|m| (m.total_mb.saturating_sub(2048)).max(2048) as u32).unwrap_or(8192);
+    requested.clamp(1024, max)
+}
+
+#[tauri::command]
+fn get_system_memory() -> Result<SystemMemory, String> { read_system_memory().ok_or_else(|| "Не удалось определить объём ОЗУ".to_string()) }
+
 #[tauri::command]
 async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_dir: String, java_path: Option<String>, launcher_jar: Option<String>, version_override: Option<String>) -> Result<(), String> {
     eprintln!("[LAUNCH] launch_minecraft called: username={}, ram_mb={}, game_dir={}", username, ram_mb, game_dir);
     if username.trim().is_empty() { return Err("Введите ник".into()); }
-    let ram = ram_mb.clamp(2048, 8192); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
+    if let Err(e) = ensure_assets(&expand_windows_path(&game_dir)) { eprintln!("[LAUNCH] ensure_assets failed: {e}"); }
+    let ram = clamp_ram_mb(ram_mb); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
     eprintln!("[LAUNCH] java path: {:?}", java);
     let config = launcher_config()?;
     let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
@@ -488,19 +657,60 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let server = format!("{}:{}", effective_config.server_address, effective_config.server_port);
     let profile_text = fs::read_to_string(game_path.join("versions").join(&version_id).join(format!("{version_id}.json"))).map_err(|e| format!("Не найден профиль Minecraft {version_id}: {e}"))?;
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
-    let libraries = profile.libraries.unwrap_or_default().into_iter().filter_map(|library| library.artifact.map(|a| game_path.join(a.path))).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
+    let libraries = profile.libraries.unwrap_or_default().into_iter().filter(|library| {
+        // Skip libraries restricted to other operating systems/architectures.
+        if let Some(name) = &library.name { if name.ends_with("natives-windows-arm64") || name.ends_with("natives-windows-x86") { return false; } }
+        match &library.rules {
+            Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
+            None => true,
+        }
+    }).filter_map(|library| library.artifact.map(|a| {
+        // Some profiles (TLauncher) store paths with a "libraries/" prefix, others without it.
+        let direct = game_path.join(&a.path);
+        if direct.exists() { direct } else { game_path.join("libraries").join(&a.path) }
+    })).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
+    let assets_index = profile.assets.clone().unwrap_or_else(|| config.minecraft_version.clone());
     let classpath = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).collect::<Vec<_>>().join(";");
-    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", effective_config.minecraft_version.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", assets_index.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
     let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
-    let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{ram}M")];
+    let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{}M", ram.min(2048))];
     if let Some(jvm) = jvm { args.extend(profile_values(&jvm, &replacements)); }
     args.extend(["-cp".into(), classpath, profile.main_class.unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into())]);
     if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
     args.extend(["--server".into(), effective_config.server_address.clone(), "--port".into(), effective_config.server_port.to_string()]);
     eprintln!("[LAUNCH] spawning java with args: {:?}", args);
-    Command::new(java).args(args).env("GORIZONT_SERVER", server).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; 
+    ensure_game_files(&app, &game_path, &version_id).await?;
+    // Make sure the Gorizont server is in the multiplayer list.
+    match servers::ensure_default_server(&game_path, "Gorizont", &server) { Ok(changed) => eprintln!("[LAUNCH] servers.dat updated={changed}"), Err(e) => eprintln!("[LAUNCH] servers.dat error: {e}") }
+    let java_log_path = game_path.join("launcher-java.log");
+    let java_log = fs::File::create(&java_log_path).map_err(|e| format!("Не удалось создать лог Java: {e}"))?;
+    let java_err = java_log.try_clone().map_err(|e| e.to_string())?;
+    let mut child = Command::new(java).args(args).current_dir(&game_path).env("GORIZONT_SERVER", server).stdout(std::process::Stdio::from(java_log)).stderr(std::process::Stdio::from(java_err)).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; 
     eprintln!("[LAUNCH] Java spawned successfully");
+    // Hide the launcher while Minecraft is running and bring it back when the game exits.
+    let window = app.get_webview_window("main");
+    if let Some(w) = &window { let _ = w.hide(); }
+    std::thread::spawn(move || {
+        let status = child.wait();
+        eprintln!("[LAUNCH] Minecraft exited: {:?}", status);
+        if let Some(w) = window { let _ = w.show(); let _ = w.unminimize(); let _ = w.set_focus(); }
+        let _ = app.emit("minecraft-exited", ());
+    });
     Ok(())
+}
+
+#[derive(Serialize)]
+struct MojangProfile { id: String, name: String }
+
+/// Looks a nickname up in Mojang's database. Returns None when no licensed account has this name.
+#[tauri::command]
+async fn lookup_mojang_profile(username: String) -> Result<Option<MojangProfile>, String> {
+    let name = username.trim();
+    if name.len() < 3 || name.len() > 16 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return Ok(None); }
+    let response = reqwest::Client::new().get(format!("https://api.mojang.com/users/profiles/minecraft/{name}")).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND || response.status() == reqwest::StatusCode::NO_CONTENT { return Ok(None); }
+    let value: serde_json::Value = response.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    Ok(match (value.get("id").and_then(|v| v.as_str()), value.get("name").and_then(|v| v.as_str())) { (Some(id), Some(name)) => Some(MojangProfile { id: id.into(), name: name.into() }), _ => None })
 }
 
 #[tauri::command]
@@ -512,7 +722,5 @@ async fn link_ip_to_account(username: String) -> Result<(), String> {
 fn main() { 
     eprintln!("[MAIN] Starting Gorizont Launcher");
     std::io::stderr().flush().ok();
-    // Test file write
-    let _ = std::fs::write("C:\\test_launcher.txt", "MAIN CALLED");
-    tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
+    tauri::Builder::default().plugin(tauri_plugin_shell::init()).invoke_handler(tauri::generate_handler![get_system_memory, lookup_mojang_profile, download_and_extract_modpack, check_and_update_modpack, check_launcher_update, download_launcher_update, launch_minecraft, link_ip_to_account]).run(tauri::generate_context!()).expect("error while running Gorizont Launcher"); 
 }
