@@ -828,12 +828,13 @@ fn filter_jvm_args(args: &[String], java_info: &JavaInfo, _required_java: u32) -
     filtered
 }
 
-/// Escape a Windows command argument: quote if it contains spaces or quotes.
+/// Escape a Windows command argument: quote if it contains spaces or double-quotes.
+/// Backslashes in Windows paths are normal and do NOT need quoting.
 fn escape_windows_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "".to_string();
     }
-    let needs_quote = arg.contains(' ') || arg.contains('"') || arg.contains('\\');
+    let needs_quote = arg.contains(' ') || arg.contains('"');
     if !needs_quote {
         return arg.to_string();
     }
@@ -974,7 +975,16 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
 
     // --- Log the full command line before spawning ---
     let java_log_path = game_path.join("launcher-java.log");
-    log_launch_command(&java_log_path, &java, &args);
+    // Write command to log, then open in append mode for Java's stdout/stderr
+    {
+        let mut f = fs::File::create(&java_log_path).map_err(|e| format!("Не удалось создать лог Java: {e}"))?;
+        let _ = writeln!(f, "=== Gorizont Launcher Java command ===");
+        let _ = writeln!(f, "Java: {}", java.display());
+        for arg in &args {
+            let _ = writeln!(f, "{}", escape_windows_arg(arg));
+        }
+        let _ = writeln!(f, "=====================================");
+    }
     eprintln!("[LAUNCH] spawning java with {} args", args.len());
 
     ensure_game_files(&app, &game_path, &version_id).await?;
@@ -982,7 +992,11 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     match servers::ensure_default_server(&game_path, "Gorizont", &server) { Ok(changed) => eprintln!("[LAUNCH] servers.dat updated={changed}"), Err(e) => eprintln!("[LAUNCH] servers.dat error: {e}") }
 
     // Spawn Java with captured stderr, cleared _JAVA_OPTIONS, and escaped paths.
-    let java_log = fs::File::create(&java_log_path).map_err(|e| format!("Не удалось создать лог Java: {e}"))?;
+    let java_log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&java_log_path)
+        .map_err(|e| format!("Не удалось создать лог Java: {e}"))?;
     let java_err = java_log.try_clone().map_err(|e| e.to_string())?;
     let mut child = Command::new(&java)
         .args(args.iter().map(|a| a.as_str()))
