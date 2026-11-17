@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{env, fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::Command};
+use std::{env, fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::{Command, Stdio}};
 use tauri::{AppHandle, Emitter, Manager};
 use zip::ZipArchive;
 
@@ -729,6 +729,145 @@ fn read_system_memory() -> Option<SystemMemory> {
     None
 }
 
+/// Information about a detected Java installation.
+#[derive(Debug, Clone)]
+struct JavaInfo {
+    major_version: u32,
+    is_64bit: bool,
+}
+
+/// Run `java -XshowSettings:properties -version` and parse version + architecture.
+fn detect_java_info(java_path: &Path) -> Result<JavaInfo, String> {
+    let output = Command::new(java_path)
+        .arg("-XshowSettings:properties")
+        .arg("-version")
+        .output()
+        .map_err(|e| format!("Не удалось запустить java -version: {e}"))?;
+    let output_str = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr).to_string();
+
+    let mut major_version: Option<u32> = None;
+    let mut is_64bit: Option<bool> = None;
+
+    for line in output_str.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("java.version = ") {
+            let v: Option<u32> = rest.split('.').next()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| rest.split('_').next().and_then(|s| s.parse().ok()));
+            major_version = v;
+        } else if let Some(rest) = line.strip_prefix("sun.arch.data.model = ") {
+            is_64bit = Some(rest.trim() == "64");
+        } else if let Some(rest) = line.strip_prefix("os.arch = ") {
+            if is_64bit.is_none() {
+                is_64bit = Some(rest.contains("64") || rest == "amd64" || rest == "aarch64");
+            }
+        }
+    }
+
+    let major = major_version.ok_or_else(|| "Не удалось определить версию Java".to_string())?;
+    Ok(JavaInfo { major_version: major, is_64bit: is_64bit.unwrap_or(false) })
+}
+
+/// Required Java major version for a given Minecraft version:
+/// 1.16.5 and below → Java 8; 1.17–1.20.4 → Java 17; 1.20.5+ → Java 21.
+fn required_java_for_mc(mc_version: &str) -> u32 {
+    let parts: Vec<&str> = mc_version.split('.').collect();
+    let major: u32 = parts.get(0).and_then(|p| p.parse().ok()).unwrap_or(1);
+    let minor: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch: u32 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+
+    if major == 1 && minor <= 16 {
+        return 8;
+    }
+    if major == 1 && minor == 20 && patch >= 5 {
+        return 21;
+    }
+    if major == 1 && minor >= 17 && minor <= 20 {
+        return 17;
+    }
+    if major > 1 || minor > 20 {
+        return 21;
+    }
+    17
+}
+
+/// Remove JVM flags that don't exist on older Java versions.
+fn filter_jvm_args(args: &[String], java_info: &JavaInfo, _required_java: u32) -> Vec<String> {
+    let mut filtered = Vec::new();
+    for arg in args {
+        let lower = arg.to_lowercase();
+
+        // Java 8 doesn't know --add-opens / --add-exports / --add-modules
+        if java_info.major_version < 9 {
+            if lower.starts_with("--add-opens") || lower.starts_with("--add-exports") || lower.starts_with("--add-modules") {
+                continue;
+            }
+            // ZGC / Shenandoah / Epsilon don't exist on Java 8
+            if lower.contains("-XX:+UseZGC") || lower.contains("-XX:+UseShenandoahGC")
+                || lower.contains("-XX:+UseEpsilonGC") {
+                continue;
+            }
+        }
+
+        filtered.push(arg.clone());
+    }
+    filtered
+}
+
+/// Escape a Windows command argument: quote if it contains spaces or quotes.
+fn escape_windows_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "".to_string();
+    }
+    let needs_quote = arg.contains(' ') || arg.contains('"') || arg.contains('\\');
+    if !needs_quote {
+        return arg.to_string();
+    }
+    let escaped = arg.replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
+/// Clamp RAM considering Java bitness: 32-bit Java can't use more than ~1500 MB.
+fn clamp_ram_for_java(requested: u32, java_info: &JavaInfo) -> u32 {
+    let system_max = read_system_memory()
+        .map(|m| (m.total_mb.saturating_sub(2048)).max(2048) as u32)
+        .unwrap_or(8192);
+    let mut max = system_max.min(8192);
+    if !java_info.is_64bit {
+        max = max.min(1400); // 32-bit JVM: stay well under 2 GB limit
+    }
+    requested.clamp(256, max)
+}
+
+/// Write the full launch command line to the log file for debugging.
+fn log_launch_command(log_path: &Path, java_path: &Path, args: &[String]) {
+    if let Ok(mut f) = fs::File::create(log_path) {
+        let _ = writeln!(f, "=== Gorizont Launcher Java command ===");
+        let _ = writeln!(f, "Java: {}", java_path.display());
+        for arg in args {
+            let _ = writeln!(f, "{}", escape_windows_arg(arg));
+        }
+        let _ = writeln!(f, "=====================================");
+    }
+}
+
+/// Read the tail of a log file (last N lines) for error diagnostics.
+fn read_log_tail(log_path: &Path, lines: usize) -> String {
+    fs::read_to_string(log_path)
+        .ok()
+        .and_then(|content| {
+            let mut lines_vec: Vec<&str> = content.lines().collect();
+            let selected = if lines_vec.len() > lines {
+                lines_vec.split_off(lines_vec.len() - lines)
+            } else {
+                lines_vec
+            };
+            Some(selected.join("\n"))
+        })
+        .unwrap_or_else(|| "<не удалось прочитать лог>".to_string())
+}
+
 /// Keep at least 2 GB for Windows and other apps; never allocate more than the PC really has.
 fn clamp_ram_mb(requested: u32) -> u32 {
     let max = read_system_memory().map(|m| (m.total_mb.saturating_sub(2048)).max(2048) as u32).unwrap_or(8192);
@@ -756,8 +895,6 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     eprintln!("[LAUNCH] launch_minecraft called: username={}, ram_mb={}, game_dir={}", username, ram_mb, game_dir);
     if username.trim().is_empty() { return Err("Введите ник".into()); }
     if let Err(e) = ensure_assets(&expand_windows_path(&game_dir)) { eprintln!("[LAUNCH] ensure_assets failed: {e}"); }
-    let ram = clamp_ram_mb(ram_mb); let java = match java_path.filter(|p| !p.trim().is_empty()) { Some(path) => expand_windows_path(&path), None => ensure_java(&app).await? };
-    eprintln!("[LAUNCH] java path: {:?}", java);
     let config = launcher_config()?;
     let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
     let effective_config = resolve_effective_config(&config, &override_opt);
@@ -767,6 +904,30 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
     eprintln!("[LAUNCH] jar path: {:?}, exists={}", jar, jar.exists());
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
+
+    // --- Java detection: version + architecture ---
+    let java = match java_path.filter(|p| !p.trim().is_empty()) {
+        Some(path) => expand_windows_path(&path),
+        None => ensure_java(&app).await?,
+    };
+    eprintln!("[LAUNCH] java path: {:?}", java);
+    let java_info = detect_java_info(&java)?;
+    eprintln!("[LAUNCH] Java {} (64bit={})", java_info.major_version, java_info.is_64bit);
+
+    // --- Required Java for this Minecraft version ---
+    let mc_version = effective_config.minecraft_version.as_str();
+    let required_java = required_java_for_mc(mc_version);
+    if java_info.major_version < required_java {
+        return Err(format!(
+            "Для Minecraft {} требуется Java {}, а установлена Java {}. Обновите Java.",
+            mc_version, required_java, java_info.major_version
+        ));
+    }
+
+    // --- RAM limit: 32-bit Java capped at ~1400 MB ---
+    let ram = clamp_ram_for_java(ram_mb, &java_info);
+    eprintln!("[LAUNCH] RAM: {} MB (32bit={})", ram, java_info.is_64bit);
+
     let server = format!("{}:{}", effective_config.server_address, effective_config.server_port);
     let profile_text = fs::read_to_string(game_path.join("versions").join(&version_id).join(format!("{version_id}.json"))).map_err(|e| format!("Не найден профиль Minecraft {version_id}: {e}"))?;
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
@@ -783,29 +944,56 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
         if direct.exists() { direct } else { game_path.join("libraries").join(&a.path) }
     })).filter(|path| path.exists()).map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
     let assets_index = profile.assets.clone().unwrap_or_else(|| config.minecraft_version.clone());
-    let classpath = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).collect::<Vec<_>>().join(";");
-    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", assets_index.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string()), ("${library_directory}", game_path.join("libraries").to_string_lossy().to_string()), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
+    // Escape each classpath entry for paths with spaces/Cyrillic, then join with ;
+    let cp_entries: Vec<String> = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).map(|p| escape_windows_arg(&p)).collect();
+    let classpath = cp_entries.join(";");
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", assets_index.clone()), ("${auth_access_token}", "0".into()), ("${auth_uuid}", "00000000000000000000000000000000".into()), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", escape_windows_arg(&game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())), ("${library_directory}", escape_windows_arg(&game_path.join("libraries").to_string_lossy().to_string())), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
     let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
     let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{}M", ram.min(2048))];
-    if let Some(jvm) = jvm { args.extend(profile_values(&jvm, &replacements)); }
+    if let Some(jvm) = jvm {
+        let mut jvm_args = profile_values(&jvm, &replacements);
+        jvm_args = filter_jvm_args(&jvm_args, &java_info, required_java);
+        args.extend(jvm_args);
+    }
     args.extend(["-cp".into(), classpath, profile.main_class.unwrap_or_else(|| "cpw.mods.bootstraplauncher.BootstrapLauncher".into())]);
     if let Some(game) = game { args.extend(profile_values(&game, &replacements)); }
     args.extend(["--server".into(), effective_config.server_address.clone(), "--port".into(), effective_config.server_port.to_string()]);
-    eprintln!("[LAUNCH] spawning java with args: {:?}", args);
+
+    // --- Log the full command line before spawning ---
+    let java_log_path = game_path.join("launcher-java.log");
+    log_launch_command(&java_log_path, &java, &args);
+    eprintln!("[LAUNCH] spawning java with {} args", args.len());
+
     ensure_game_files(&app, &game_path, &version_id).await?;
     // Make sure the Gorizont server is in the multiplayer list.
     match servers::ensure_default_server(&game_path, "Gorizont", &server) { Ok(changed) => eprintln!("[LAUNCH] servers.dat updated={changed}"), Err(e) => eprintln!("[LAUNCH] servers.dat error: {e}") }
-    let java_log_path = game_path.join("launcher-java.log");
+
+    // Spawn Java with captured stderr, cleared _JAVA_OPTIONS, and escaped paths.
     let java_log = fs::File::create(&java_log_path).map_err(|e| format!("Не удалось создать лог Java: {e}"))?;
     let java_err = java_log.try_clone().map_err(|e| e.to_string())?;
-    let mut child = Command::new(java).args(args).current_dir(&game_path).env("GORIZONT_SERVER", server).stdout(std::process::Stdio::from(java_log)).stderr(std::process::Stdio::from(java_err)).spawn().map_err(|e| format!("Не удалось запустить Java: {e}"))?; 
-    eprintln!("[LAUNCH] Java spawned successfully");
+    let mut child = Command::new(&java)
+        .args(args.iter().map(|a| a.as_str()))
+        .current_dir(&game_path)
+        .env("GORIZONT_SERVER", &server)
+        .env_remove("_JAVA_OPTIONS")
+        .stdout(Stdio::from(java_log.try_clone().unwrap_or(java_log)))
+        .stderr(Stdio::from(java_err))
+        .spawn()
+        .map_err(|e| format!("Не удалось запустить Java: {e}"))?;
+    eprintln!("[LAUNCH] Java spawned successfully (pid={:?})", child.id());
+
     // Hide the launcher while Minecraft is running and bring it back when the game exits.
     let window = app.get_webview_window("main");
     if let Some(w) = &window { let _ = w.hide(); }
+    let log_path_clone = java_log_path.clone();
     std::thread::spawn(move || {
         let status = child.wait();
+        // Read the tail of the log for any JVM error messages.
+        let tail = read_log_tail(&log_path_clone, 20);
         eprintln!("[LAUNCH] Minecraft exited: {:?}", status);
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("[LAUNCH] Java stderr tail:\n{}", tail);
+        }
         if let Some(w) = window { let _ = w.show(); let _ = w.unminimize(); let _ = w.set_focus(); }
         let _ = app.emit("minecraft-exited", ());
     });
