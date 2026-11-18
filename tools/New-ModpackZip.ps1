@@ -1,7 +1,8 @@
 param(
   [Parameter(Mandatory = $true)] [string]$Source,
   [Parameter(Mandatory = $true)] [string]$PackVersion,
-  [string]$Output = "modpack.zip"
+  [string]$Output = "modpack.zip",
+  [string]$LoaderVersion = "266"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,12 +11,15 @@ $temp = Join-Path $env:TEMP ("gorizont-pack-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $temp | Out-Null
 try {
   Copy-Item (Join-Path $sourcePath '*') $temp -Recurse -Force
+  # Old client profiles are installed by the launcher itself; never ship them.
+  $oldVersions = Join-Path $temp 'versions'
+  if (Test-Path $oldVersions) { Remove-Item $oldVersions -Recurse -Force }
   $manifest = [ordered]@{
     schema_version = 1
     pack_id = 'gorizont'
     pack_version = $PackVersion
     minecraft_version = '1.21.1'
-    loader = [ordered]@{ type = 'neoforge'; version = '248' }
+    loader = [ordered]@{ type = 'neoforge'; version = $LoaderVersion }
   }
   $manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $temp 'manifest.json') -Encoding UTF8
   if (Test-Path $Output) { Remove-Item $Output -Force }
