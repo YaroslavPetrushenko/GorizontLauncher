@@ -27,8 +27,11 @@ export default function App() {
   const [status, setStatus] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [version, setVersion] = useState('1.2.0');
+  const [version, setVersion] = useState('1.2.3');
   const [memory, setMemory] = useState<SystemMemory | null>(null);
+  const gameRunning = useRef(false);
+  const busyRef = useRef(false);
+  busyRef.current = busy;
 
   const lang: Lang = settings.lang ?? detectLang();
   const t = useMemo(() => makeT(lang), [lang]);
@@ -39,7 +42,7 @@ export default function App() {
     getVersion().then(setVersion).catch(() => undefined);
     invoke<LauncherUpdate | null>('check_launcher_update').then(update => { if (update) setLauncherUpdate(update); }).catch(() => undefined);
     const unlisten = listen<DownloadProgress>('download-progress', e => { setProgress(e.payload); setStatus(e.payload.stage); });
-    const unlistenExit = listen('minecraft-exited', () => { setBusy(false); setStatus(null); setProgress(null); });
+    const unlistenExit = listen('minecraft-exited', () => { gameRunning.current = false; setBusy(false); setStatus(null); setProgress(null); });
     return () => { unlisten.then(f => f()); unlistenExit.then(f => f()); };
   }, []);
 
@@ -66,9 +69,25 @@ export default function App() {
       setStatus(t('launching'));
       await invoke('launch_minecraft', { username: account.username, ramMb: effectiveRam(settings, memory), gameDir: settings.gameDir });
       invoke('link_ip_to_account', { username: account.username }).catch(() => undefined);
+      gameRunning.current = true;
       setStatus(t('gameStarted'));
     } catch (e) { setStatus(String(e)); } finally { setBusy(false); }
   };
+
+  // Live updates: re-check the launcher and the modpack every few minutes while the launcher is open.
+  // Nothing is installed while the game is running or another action is in progress.
+  const periodicCheck = useRef<() => void>(() => undefined);
+  periodicCheck.current = () => {
+    if (busyRef.current || gameRunning.current) return;
+    invoke<LauncherUpdate | null>('check_launcher_update').then(update => { if (update) setLauncherUpdate(update); }).catch(() => undefined);
+    if (!account) return;
+    setBusy(true);
+    prepare().finally(() => setBusy(false));
+  };
+  useEffect(() => {
+    const id = window.setInterval(() => periodicCheck.current(), 5 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // Check the modpack automatically once the launcher is opened with a saved profile.
   const startupChecked = useRef(false);
