@@ -25,7 +25,7 @@ try {
   ""pack_id"": ""gorizont"",
   ""pack_version"": ""2.0.0"",
   ""minecraft_version"": ""1.21.1"",
-  ""loader"": { ""type"": ""neoforge"", ""version"": ""249"" }
+  ""loader"": { ""type"": ""neoforge"", ""version"": ""266"" }
 }
 "@
   Set-Content (Join-Path $staging 'manifest.json') $manifest -Encoding UTF8

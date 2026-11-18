@@ -119,7 +119,9 @@ struct LauncherConfig {
     expected_manifest: String,
     pack_id: String,
     minecraft_version: String,
+    #[serde(default)]
     loader_type: String,
+    #[serde(default)]
     loader_version: String,
     server_address: String,
     server_port: u16,
@@ -724,9 +726,10 @@ fn read_installed_loader(game_path: &Path, config: &LauncherConfig) -> LoaderInf
     if let Ok(text) = fs::read_to_string(game_path.join(".gorizont-installed.json")) {
         if let Ok(m) = serde_json::from_str::<PackManifest>(&text) { return LoaderInfo { mc: m.minecraft_version, kind: m.loader.r#type, version: m.loader.version }; }
     }
+    // No installed pack yet: the loader is unknown until the pack's manifest.json is downloaded.
     LoaderInfo { mc: config.minecraft_version.clone(), kind: config.loader_type.clone(), version: config.loader_version.clone() }
 }
-fn loader_version_id(l: &LoaderInfo) -> String { format!("{}-{}-{}", l.mc, l.kind, l.version) }
+fn loader_version_id(l: &LoaderInfo) -> String { if l.version.is_empty() { String::new() } else { format!("{}-{}-{}", l.mc, l.kind, l.version) } }
 fn pack_version_id(game_path: &Path, config: &LauncherConfig) -> String { loader_version_id(&read_installed_loader(game_path, config)) }
 
 /// Full NeoForge version for a manifest value: "266" + Minecraft 1.21.1 -> "21.1.266"; values with dots are used as is.
@@ -740,6 +743,7 @@ fn neoforge_full_version(l: &LoaderInfo) -> String {
 /// self-contained version profile `versions/<mc>-<loader>-<version>/`.
 async fn ensure_loader(app: &AppHandle, game_path: &Path, info: &LoaderInfo) -> Result<(), String> {
     let version_id = loader_version_id(info);
+    if version_id.is_empty() { return Err("Сборка ещё не установлена: загрузчик указывается в manifest.json модпака".into()); }
     let dir = game_path.join("versions").join(&version_id);
     let json_path = dir.join(format!("{version_id}.json"));
     let jar_path = dir.join(format!("{version_id}.jar"));
@@ -963,7 +967,7 @@ async fn prepare_game_files(app: AppHandle, game_dir: String, version_override: 
     let loader = read_installed_loader(&game_path, &effective_config);
     let version_id = loader_version_id(&loader);
     if let Err(e) = ensure_assets(&game_path) { eprintln!("[PREPARE] ensure_assets failed: {e}"); }
-    ensure_loader(&app, &game_path, &loader).await?;
+    if !version_id.is_empty() { ensure_loader(&app, &game_path, &loader).await?; }
     ensure_game_files(&app, &game_path, &version_id).await
 }
 

@@ -32,7 +32,7 @@ git push origin launcher-v1.0.0
   "pack_id": "gorizont",
   "pack_version": "1.0.1",
   "minecraft_version": "1.21.1",
-  "loader": { "type": "neoforge", "version": "248" }
+  "loader": { "type": "neoforge", "version": "266" }
 }
 ```
 
@@ -55,15 +55,12 @@ git push origin launcher-v1.0.0
   "pack_id": "gorizont",
   "release_mode": "modpack-only",
   "minecraft_version": "1.21.1",
-  "launch_version_id": "1.21.1-neoforge",
-  "loader_type": "neoforge",
-  "loader_version": "248",
   "server_address": "mc.gorizont.fun",
   "server_port": 20054
 }
 ```
 
-После изменения `launcher.config.json` нужно заново собрать лаунчер, потому что конфигурация встраивается в Rust-приложение при компиляции. Игроку достаточно скачать Windows-установщик один раз; обычные обновления pack-релизов скачиваются автоматически.
+Тип и версию загрузчика лаунчер берёт из `manifest.json` модпака, в конфиге их нет. После изменения `launcher.config.json` нужно заново собрать лаунчер, потому что конфигурация встраивается в Rust-приложение при компиляции. Игроку достаточно скачать Windows-установщик один раз; обычные обновления pack-релизов скачиваются автоматически.
 
 Если точного `modpack.zip` нет, лаунчер покажет ошибку и не будет скачивать исходный код репозитория. Это важно: ZIP самого лаунчера и ZIP сборки — разные файлы.
 
@@ -95,7 +92,7 @@ AuthMe Reloaded остаётся серверной системой автор�
 .\tools\New-ModpackZip.ps1 -Source "E:\GorizontPack" -PackVersion "1.0.0" -Output "modpack.zip"
 ```
 
-Скрипт добавляет в корень ZIP правильный `manifest.json` с Minecraft 1.21.1 и NeoForge 248. Затем создай GitHub Release с тегом `pack-1.0.0` и прикрепи получившийся `modpack.zip`.
+Скрипт добавляет в корень ZIP правильный `manifest.json` с Minecraft 1.21.1 и NeoForge 266. Затем создай GitHub Release с тегом `pack-1.0.0` и прикрепи получившийся `modpack.zip`.
 
 Для профиля из другого лаунчера, где версия называется `Create(VOID)`, используй:
 
