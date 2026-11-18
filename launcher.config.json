@@ -6,8 +6,6 @@
   "pack_id": "gorizont",
   "release_mode": "modpack-only",
   "minecraft_version": "1.21.1",
-  "loader_type": "neoforge",
-  "loader_version": "266",
   "server_address": "mc.gorizont.fun",
   "server_port": 20054
 }
