@@ -12,14 +12,28 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use zip::ZipArchive;
 
-const VERSION_ID: &str = "1.21.1-neoforge";
-const WEBHOOK_URL: &str = "";
-const WEBHOOK_TOKEN: &str = "";
 const JAVA_DOWNLOAD_URL: &str = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
+
+fn webhook_url() -> String {
+    env::var("WEBHOOK_URL").unwrap_or_default()
+}
+
+fn webhook_token() -> String {
+    env::var("WEBHOOK_TOKEN").unwrap_or_default()
+}
 
 fn expand_windows_path(input: &str) -> PathBuf {
     let mut value = input.to_string();
-    if value.contains("%APPDATA%") { if let Ok(app_data) = env::var("APPDATA") { value = value.replace("%APPDATA%", &app_data); } }
+    if value.contains("%APPDATA%") {
+        if let Ok(app_data) = env::var("APPDATA") {
+            value = value.replace("%APPDATA%", &app_data);
+        }
+    }
+    if value.contains("%LOCALAPPDATA%") {
+        if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+            value = value.replace("%LOCALAPPDATA%", &local_app_data);
+        }
+    }
     PathBuf::from(value.replace('/', "\\"))
 }
 
@@ -191,17 +205,6 @@ struct VersionOverride {
     loader_version: Option<String>,
 }
 
-fn resolve_version_id(config: &LauncherConfig, override_opt: &Option<VersionOverride>) -> String {
-    let mc = override_opt.as_ref().and_then(|o| o.minecraft_version.as_deref()).unwrap_or(&config.minecraft_version);
-    let lt = override_opt.as_ref().and_then(|o| o.loader_type.as_deref()).unwrap_or(&config.loader_type);
-    let lv = override_opt.as_ref().and_then(|o| o.loader_version.as_deref()).unwrap_or(&config.loader_version);
-    format!("{}-{}-{}", mc, lt, lv)
-}
-
-fn version_id(config: &LauncherConfig) -> String {
-    resolve_version_id(config, &None)
-}
-
 fn releases_api_url(config: &LauncherConfig) -> String {
     format!("https://api.github.com/repos/{}/{}/releases?per_page=30", config.github_owner, config.github_repo)
 }
@@ -264,7 +267,8 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
         let enclosed = file.enclosed_name().ok_or_else(|| "Небезопасный путь в архиве".to_string())?.to_owned();
-    if enclosed.components().count() == 1 && enclosed.to_string_lossy() == config.expected_manifest {
+        let file_name = enclosed.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name == config.expected_manifest {
             let mut text = String::new(); file.read_to_string(&mut text).map_err(|e| e.to_string())?;
             manifest = Some(serde_json::from_str(&text).map_err(|e| format!("Некорректный manifest.json: {e}"))?);
             continue;
@@ -275,7 +279,7 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
         let mut output = fs::File::create(&out).map_err(|e| e.to_string())?;
         io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
     }
-    let manifest = manifest.ok_or_else(|| format!("В корне modpack.zip отсутствует {}", config.expected_manifest))?;
+    let manifest = manifest.ok_or_else(|| format!("В архиве modpack.zip отсутствует {}", config.expected_manifest))?;
     retire_stale_mods(archive, target);
     validate_manifest(&manifest, config)?;
     Ok(manifest)
@@ -310,7 +314,13 @@ async fn download_launcher_update(app: AppHandle, url: String) -> Result<(), Str
     let response = reqwest::Client::new().get(&url).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
     let total = response.content_length(); let mut downloaded = 0; let mut bytes = Vec::new(); let mut stream = response.bytes_stream(); emit_progress(&app, "Скачиваем обновление лаунчера...", 0, total);
     while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(&app, "Скачиваем обновление лаунчера...", downloaded, total); }
-    let path = launcher_data_dir()?.join("GorizontLauncher-update.exe"); fs::write(&path, bytes).map_err(|e| e.to_string())?; emit_progress(&app, "Устанавливаем обновление поверх текущей версии...", 1, Some(1));
+    let path = launcher_data_dir()?.join("GorizontLauncher-update.exe"); fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    // Verify the installer file was written and has content
+    let file_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    if file_size == 0 {
+        return Err("Скачанный установщик пуст".into());
+    }
+    emit_progress(&app, "Устанавливаем обновление поверх текущей версии...", 1, Some(1));
     // NSIS updates the existing installation in place; it is never an uninstall action.
     // Use detached process group so the installer survives after this launcher exits.
     let mut cmd = Command::new(&path);
@@ -320,9 +330,24 @@ async fn download_launcher_update(app: AppHandle, url: String) -> Result<(), Str
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x00000200 | 0x00000010); // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
     }
-    cmd.spawn().map_err(|e| format!("Не удалось запустить установщик: {e}"))?;
-    // Give the installer a moment to start before we exit
+    let mut child = cmd.spawn().map_err(|e| format!("Не удалось запустить установщик: {e}"))?;
+    // Give the installer a moment to start and verify it's running
     thread::sleep(Duration::from_secs(2));
+    // Check if the process is still alive (hasn't exited immediately with an error)
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            if !status.success() {
+                return Err(format!("Установщик завершился с ошибкой (код: {})", status.code().unwrap_or(-1)));
+            }
+        }
+        Ok(None) => {
+            // Process is still running, good
+        }
+        Err(e) => {
+            // Could not check process status, assume it's running
+            eprintln!("[UPDATE] Could not verify installer process status: {}", e);
+        }
+    }
     app.exit(0); Ok(())
 }
 
@@ -389,7 +414,15 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                 {
                     match latest_pack_version(&effective_config).await {
                         Some(latest) if version_newer(&latest, &installed.pack_version) => { log(&format!("newer pack on GitHub: {} > {}", latest, installed.pack_version)); force_update = true; }
-                        _ => { log("jar, json and libraries exist and pack is up to date"); return Ok(installed.pack_version); }
+                        _ => { 
+                            if jar_exists && json_exists && libs_exist && mods_exist {
+                                log("jar, json, libraries and mods exist and pack is up to date");
+                                return Ok(installed.pack_version);
+                            } else {
+                                log(&format!("Missing files: jar={}, json={}, libs={}, mods={} - forcing update", jar_exists, json_exists, libs_exist, mods_exist));
+                                force_update = true;
+                            }
+                        }
                     }
                 }
             } else {
@@ -434,7 +467,49 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                 // Strip UTF-8 BOM if present
                 let manifest_text = manifest_text.trim_start_matches('\u{feff}');
                 // Fix double-quoted keys like ""schema_version"" -> "schema_version"
-                let manifest_text = manifest_text.replace("\"\"", "\"");
+                // Only replace ""key"" -> "key" when it appears before a colon (JSON key)
+                let manifest_text = {
+                    let mut result = String::new();
+                    let mut i = 0;
+                    let chars: Vec<char> = manifest_text.chars().collect();
+                    while i < chars.len() {
+                        if chars[i] == '"' && i + 1 < chars.len() && chars[i + 1] == '"' {
+                            // Found double quote - check if this looks like a doubled key
+                            // Look ahead to find the closing "" and then a colon
+                            let mut j = i + 2;
+                            let mut found_closing = false;
+                            while j + 1 < chars.len() {
+                                if chars[j] == '"' && chars[j + 1] == '"' {
+                                    found_closing = true;
+                                    break;
+                                }
+                                j += 1;
+                            }
+                            if found_closing {
+                                // Check if after the closing "" there's a colon (possibly with whitespace)
+                                let mut k = j + 2;
+                                while k < chars.len() && chars[k].is_whitespace() {
+                                    k += 1;
+                                }
+                                if k < chars.len() && chars[k] == ':' {
+                                    // This is a doubled key - write single quotes
+                                    result.push('"');
+                                    i += 2; // skip the opening ""
+                                    while i < j {
+                                        result.push(chars[i]);
+                                        i += 1;
+                                    }
+                                    result.push('"');
+                                    i = j + 2; // skip the closing ""
+                                    continue;
+                                }
+                            }
+                        }
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                    result
+                };
                 log(&format!("manifest after BOM/quote fix: {:?}", manifest_text));
                 let manifest_result: Result<PackManifest, _> = serde_json::from_str(&manifest_text);
                 let manifest = match manifest_result {
@@ -470,6 +545,12 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                     io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
                 }
                 log("All files extracted");
+                
+                // Remove stale mods that are no longer in the pack
+                let cursor3 = io::Cursor::new(fs::read(&local_path).map_err(|e| format!("Не удалось прочитать локальный модпак: {e}"))?);
+                let mut archive3 = ZipArchive::new(cursor3).map_err(|e| format!("Некорректный ZIP архив: {}", e))?;
+                retire_stale_mods(&mut archive3, &target);
+                log("Stale mods retired");
                 
                 // Ensure libraries, mods and config exist (copy from default .minecraft if missing)
                 if let Err(e) = ensure_assets(&target) {
@@ -854,18 +935,6 @@ fn clamp_ram_for_java(requested: u32, java_info: &JavaInfo) -> u32 {
     requested.clamp(256, max)
 }
 
-/// Write the full launch command line to the log file for debugging.
-fn log_launch_command(log_path: &Path, java_path: &Path, args: &[String]) {
-    if let Ok(mut f) = fs::File::create(log_path) {
-        let _ = writeln!(f, "=== Gorizont Launcher Java command ===");
-        let _ = writeln!(f, "Java: {}", java_path.display());
-        for arg in args {
-            let _ = writeln!(f, "{}", escape_windows_arg(arg));
-        }
-        let _ = writeln!(f, "=====================================");
-    }
-}
-
 /// Read the tail of a log file (last N lines) for error diagnostics.
 fn read_log_tail(log_path: &Path, lines: usize) -> String {
     fs::read_to_string(log_path)
@@ -882,12 +951,6 @@ fn read_log_tail(log_path: &Path, lines: usize) -> String {
         .unwrap_or_else(|| "<не удалось прочитать лог>".to_string())
 }
 
-/// Keep at least 2 GB for Windows and other apps; never allocate more than the PC really has.
-fn clamp_ram_mb(requested: u32) -> u32 {
-    let max = read_system_memory().map(|m| (m.total_mb.saturating_sub(2048)).max(2048) as u32).unwrap_or(8192);
-    requested.clamp(1024, max)
-}
-
 #[tauri::command]
 fn get_system_memory() -> Result<SystemMemory, String> { read_system_memory().ok_or_else(|| "Не удалось определить объём ОЗУ".to_string()) }
 
@@ -895,9 +958,9 @@ fn get_system_memory() -> Result<SystemMemory, String> { read_system_memory().ok
 async fn prepare_game_files(app: AppHandle, game_dir: String, version_override: Option<String>) -> Result<(), String> {
     let config = launcher_config()?;
     let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
-    let _ = override_opt;
+    let effective_config = resolve_effective_config(&config, &override_opt);
     let game_path = expand_windows_path(&game_dir);
-    let loader = read_installed_loader(&game_path, &config);
+    let loader = read_installed_loader(&game_path, &effective_config);
     let version_id = loader_version_id(&loader);
     if let Err(e) = ensure_assets(&game_path) { eprintln!("[PREPARE] ensure_assets failed: {e}"); }
     ensure_loader(&app, &game_path, &loader).await?;
@@ -913,7 +976,7 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
     let effective_config = resolve_effective_config(&config, &override_opt);
     let game_path = expand_windows_path(&game_dir);
-    let version_id = pack_version_id(&game_path, &config);
+    let version_id = pack_version_id(&game_path, &effective_config);
     eprintln!("[LAUNCH] game_path={:?}, version_id={}", game_path, version_id);
     let jar = launcher_jar.map(|p| expand_windows_path(&p)).unwrap_or_else(|| game_path.join("versions").join(&version_id).join(format!("{version_id}.jar")));
     eprintln!("[LAUNCH] jar path: {:?}, exists={}", jar, jar.exists());
@@ -987,7 +1050,6 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     }
     eprintln!("[LAUNCH] spawning java with {} args", args.len());
 
-    ensure_game_files(&app, &game_path, &version_id).await?;
     // Make sure the Gorizont server is in the multiplayer list.
     match servers::ensure_default_server(&game_path, "Gorizont", &server) { Ok(changed) => eprintln!("[LAUNCH] servers.dat updated={changed}"), Err(e) => eprintln!("[LAUNCH] servers.dat error: {e}") }
 
@@ -1043,8 +1105,10 @@ async fn lookup_mojang_profile(username: String) -> Result<Option<MojangProfile>
 
 #[tauri::command]
 async fn link_ip_to_account(username: String) -> Result<(), String> {
-    if WEBHOOK_URL.is_empty() || WEBHOOK_TOKEN.is_empty() { return Err("Веб-хук не настроен в конфигурации лаунчера".into()); }
-    Client::new().post(WEBHOOK_URL).bearer_auth(WEBHOOK_TOKEN).json(&serde_json::json!({"username": username})).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?; Ok(())
+    let url = webhook_url();
+    let token = webhook_token();
+    if url.is_empty() || token.is_empty() { return Err("Веб-хук не настроен в конфигурации лаунчера".into()); }
+    Client::new().post(url).bearer_auth(token).json(&serde_json::json!({"username": username})).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?; Ok(())
 }
 
 fn main() { 

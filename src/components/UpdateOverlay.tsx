@@ -6,9 +6,10 @@ type Props = { t: T; progress: DownloadProgress; onClose?: () => void };
 
 export default function UpdateOverlay({ t, progress, onClose }: Props) {
   const percent = Math.max(0, Math.min(100, progress.percent));
-  const downloading = progress.stage.includes('Скачивание');
-  const unpacking = progress.stage.includes('Распаковка');
-  const done = progress.stage === 'Готово';
+  const stage = progress.stage.toLowerCase();
+  const downloading = stage.includes('downloading') || stage.includes('скачивание');
+  const unpacking = stage.includes('unpacking') || stage.includes('распаковка') || stage.includes('installing') || stage.includes('установ');
+  const done = stage.includes('done') || stage.includes('готов') || stage === 'complete' || stage === 'finished';
   return <div className="update-overlay" role="status" aria-live="polite">
     <div className="update-orbit update-orbit-one" /><div className="update-orbit update-orbit-two" />
     <div className="update-panel">

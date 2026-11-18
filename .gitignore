@@ -12,5 +12,6 @@ modpack.zip
 # Local tooling / generated files
 .cheburnexus/
 .claude/
+.npm-cache/
 *.tsbuildinfo
 src-tauri/gen/
