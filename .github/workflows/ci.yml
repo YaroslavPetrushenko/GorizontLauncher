@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, fix/neoforge-version-id ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: .
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: .
+
+      - name: Check Rust code
+        run: cargo check
+        working-directory: src-tauri
+
+      - name: Build release binary
+        run: cargo build --release
+        working-directory: src-tauri
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gorizont-launcher
+          path: src-tauri/target/release/gorizont-launcher.exe

@@ -27,7 +27,7 @@ export default function App() {
   const [status, setStatus] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [version, setVersion] = useState('1.0.12');
+  const [version, setVersion] = useState('1.2.0');
   const [memory, setMemory] = useState<SystemMemory | null>(null);
 
   const lang: Lang = settings.lang ?? detectLang();
