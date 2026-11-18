@@ -368,12 +368,13 @@ async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Latest published modpack version on GitHub (None when offline or no release has the pack asset).
-async fn latest_pack_version(config: &LauncherConfig) -> Option<String> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().ok()?;
-    let response = client.get(releases_api_url(config)).header("User-Agent", "GorizontLauncher/1.0").send().await.ok()?.error_for_status().ok()?;
-    let releases = response.json::<Vec<Release>>().await.ok()?;
-    let release = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == config.modpack_asset))?;
-    Some(release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string())
+async fn latest_pack_version(config: &LauncherConfig) -> Result<Option<String>, String> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().map_err(|e| format!("client: {e}"))?;
+    let response = client.get(releases_api_url(config)).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| format!("запрос: {e}"))?;
+    let status = response.status();
+    if !status.is_success() { return Err(format!("GitHub ответил {status}")); }
+    let releases = response.json::<Vec<Release>>().await.map_err(|e| format!("разбор ответа: {e}"))?;
+    Ok(releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == config.modpack_asset)).map(|release| release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string()))
 }
 
 #[tauri::command]
@@ -415,8 +416,10 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                 log("manifest validation passed");
                 {
                     match latest_pack_version(&effective_config).await {
-                        Some(latest) if version_newer(&latest, &installed.pack_version) => { log(&format!("newer pack on GitHub: {} > {}", latest, installed.pack_version)); force_update = true; }
-                        _ => { 
+                        Ok(Some(latest)) if version_newer(&latest, &installed.pack_version) => { log(&format!("newer pack on GitHub: {} > {}", latest, installed.pack_version)); force_update = true; }
+                        other => {
+                            if let Err(e) = &other { log(&format!("pack version check failed: {e}")); }
+                            
                             if jar_exists && json_exists && libs_exist && mods_exist {
                                 log("jar, json, libraries and mods exist and pack is up to date");
                                 return Ok(installed.pack_version);
