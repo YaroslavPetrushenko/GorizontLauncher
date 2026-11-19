@@ -1,6 +1,6 @@
 [package]
 name = "gorizont-launcher"
-version = "1.2.3"
+version = "1.2.6"
 edition = "2021"
 
 [build-dependencies]
@@ -17,6 +17,8 @@ tokio = { version = "1", features = ["fs", "io-util"] }
 futures-util = "0.3"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+ring = "0.17"
+base64 = "0.22"
 
 [features]
 default = ["custom-protocol"]
