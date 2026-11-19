@@ -12,6 +12,20 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use zip::ZipArchive;
 
+/// Public key (Ed25519, base64) that signs every modpack release. The private key never leaves the build owner's machine.
+const PACK_PUBLIC_KEY_B64: &str = "a8m9ZliWQz/Ty2SCl4iE/boPMs+ovtc6tPefWxH5go4=";
+
+/// Checks modpack.sig: an Ed25519 signature over the SHA-256 digest of the modpack.zip bytes.
+fn verify_modpack_signature(zip_bytes: &[u8], signature_b64: &str) -> Result<(), String> {
+    use base64::Engine;
+    let public = base64::engine::general_purpose::STANDARD.decode(PACK_PUBLIC_KEY_B64).map_err(|e| e.to_string())?;
+    let signature = base64::engine::general_purpose::STANDARD.decode(signature_b64.trim()).map_err(|_| "Некорректная подпись сборки".to_string())?;
+    let digest = Sha256::digest(zip_bytes);
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &public)
+        .verify(&digest, &signature)
+        .map_err(|_| "Подпись сборки не совпадает: архив изменён или подписан не автором сборки".to_string())
+}
+
 const JAVA_DOWNLOAD_URL: &str = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
 
 fn webhook_url() -> String {
@@ -288,7 +302,7 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
 }
 
 #[tauri::command]
-async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: String, expected_sha256: Option<String>) -> Result<(), String> {
+async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: String, expected_sha256: Option<String>, signature_url: Option<String>) -> Result<(), String> {
     eprintln!("[DEBUG] download_and_extract_modpack called: url={}, target_dir={}", url, target_dir);
     let target = expand_windows_path(&target_dir); fs::create_dir_all(&target).map_err(|e| e.to_string())?; let config = launcher_config()?;
     let response = reqwest::Client::new().get(&url).header("User-Agent", "GorizontLauncher/0.1").send().await.map_err(|e| e.to_string())?;
@@ -296,6 +310,10 @@ async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: S
     emit_progress(&app, "Скачивание модов...", 0, total);
     while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(&app, "Скачивание модов...", downloaded, total); }
     if let Some(expected) = expected_sha256 { let actual = format!("{:x}", Sha256::digest(&bytes)); if actual.to_lowercase() != expected.to_lowercase() { return Err("Проверка SHA-256 не пройдена".into()); } }
+    // Modpacks are installed only when their signature is valid.
+    let signature_url = signature_url.ok_or_else(|| "В релизе нет подписи modpack.sig: сборка не будет установлена".to_string())?;
+    let signature = reqwest::Client::new().get(&signature_url).header("User-Agent", "GorizontLauncher/1.0").send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("Не удалось скачать подпись: {e}"))?.text().await.map_err(|e| e.to_string())?;
+    verify_modpack_signature(&bytes, &signature)?;
     emit_progress(&app, "Распаковка модов...", 0, Some(bytes.len() as u64));
     let cursor = io::Cursor::new(bytes); let mut archive = ZipArchive::new(cursor).map_err(|e| e.to_string())?; let manifest = safe_extract(&mut archive, &target, &config)?;
     fs::write(target.join(".gorizont-installed.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -609,11 +627,12 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                 if let Some(release) = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == effective_config.modpack_asset)) {
                     let latest = release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string();
                     let asset_url = release.assets.iter().find(|a| a.name == effective_config.modpack_asset).map(|a| a.browser_download_url.clone());
+                    let signature_url = release.assets.iter().find(|a| a.name == "modpack.sig").map(|a| a.browser_download_url.clone());
                     log(&format!("GitHub fallback: latest={}, local_version={}", latest, local_version));
                     if let Some(asset_url) = asset_url {
                         if force_update || latest != local_version.trim_start_matches('v') || !marker.exists() {
                             log("Downloading from GitHub...");
-                            download_and_extract_modpack(app, asset_url, target_dir, None).await?;
+                            download_and_extract_modpack(app, asset_url, target_dir, None, signature_url).await?;
                             return Ok(latest);
                         }
                         return Ok(latest);
