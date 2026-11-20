@@ -2,14 +2,18 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
-import { Settings as SettingsIcon, Play, Zap, ShieldCheck, Download } from 'lucide-react';
+import { Settings as SettingsIcon, Play, Zap, ShieldCheck, Download, Loader2, Puzzle, FolderOpen } from 'lucide-react';
 import AuthScreen from './components/AuthScreen';
 import ProgressBar from './components/ProgressBar';
 import UpdateOverlay from './components/UpdateOverlay';
 import LauncherUpdateBanner from './components/LauncherUpdateBanner';
 import SettingsPanel from './components/Settings';
 import News, { ServerCard, useServerStatus } from './components/News';
+import UserMods from './components/UserMods';
+import ExtraMods from './components/ExtraMods';
+import ModrinthBrowser from './components/ModrinthBrowser';
 import { clearAccount, loadAccount, saveAccount, type Account } from './account';
+import { saveAuthResponse, clearAuth, tryAutoLogin, type AuthResponse } from './api';
 import { detectLang, makeT, type Lang } from './i18n';
 import { effectiveRam, type SystemMemory } from './ram';
 import type { DownloadProgress, Settings } from './types';
@@ -20,7 +24,7 @@ const defaults: Settings = { ram: 4096, ramAuto: true, gameDir: '%APPDATA%/.Gori
 const SETTINGS_KEY = 'gorizont-settings';
 
 export default function App() {
-  const [account, setAccount] = useState<Account | null>(() => loadAccount());
+  const [account, setAccount] = useState<Account | null>(null);
   const [settings, setSettings] = useState<Settings>(() => { try { return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { return defaults; } });
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [launcherUpdate, setLauncherUpdate] = useState<LauncherUpdate | null>(null);
@@ -31,23 +35,66 @@ export default function App() {
   const [memory, setMemory] = useState<SystemMemory | null>(null);
   const gameRunning = useRef(false);
   const busyRef = useRef(false);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [activeTab, setActiveTab] = useState<'main' | 'mods' | 'extra'>('main');
   busyRef.current = busy;
 
   const lang: Lang = settings.lang ?? detectLang();
   const t = useMemo(() => makeT(lang), [lang]);
   const server = useServerStatus();
 
+  // Auto-login on startup
   useEffect(() => {
+    let cancelled = false;
+    
+    const checkAuth = async () => {
+      // First try to load legacy account
+      const legacyAccount = loadAccount();
+      if (legacyAccount) {
+        if (!cancelled) setAccount(legacyAccount);
+      }
+      
+      // Then try auto-login with stored tokens
+      if (!cancelled) {
+        setBusy(true);
+        try {
+          const response = await tryAutoLogin();
+          if (response && !cancelled) {
+            setAccount({
+              username: response.user.nickname,
+              uuid: response.user.id,
+              passHash: response.access_token,
+            });
+          }
+        } catch (e) {
+          // Auto-login failed, will show auth screen
+        } finally {
+          if (!cancelled) {
+            setBusy(false);
+            setAuthChecked(true);
+          }
+        }
+      } else if (!cancelled) {
+        setAuthChecked(true);
+      }
+    };
+    
+    checkAuth();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!authChecked) return;
     invoke<SystemMemory>('get_system_memory').then(setMemory).catch(() => undefined);
     getVersion().then(setVersion).catch(() => undefined);
     invoke<LauncherUpdate | null>('check_launcher_update').then(update => { if (update) setLauncherUpdate(update); }).catch(() => undefined);
     const unlisten = listen<DownloadProgress>('download-progress', e => { setProgress(e.payload); setStatus(e.payload.stage); });
     const unlistenExit = listen('minecraft-exited', () => { gameRunning.current = false; setBusy(false); setStatus(null); setProgress(null); });
     return () => { unlisten.then(f => f()); unlistenExit.then(f => f()); };
-  }, []);
+  }, [authChecked]);
 
   const persistSettings = (next: Settings) => { setSettings(next); try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch { /* ignore */ } };
-  const logout = () => { clearAccount(); setAccount(null); setShowSettings(false); setStatus(null); };
+  const logout = () => { clearAccount(); clearAuth(); setAccount(null); setShowSettings(false); setStatus(null); };
 
   // Checks the modpack release, installs/updates it and downloads missing libraries and assets.
   const prepare = async (): Promise<boolean> => {
@@ -55,6 +102,7 @@ export default function App() {
     try {
       const installedVersion = await invoke<string>('check_and_update_modpack', { localVersion: settings.localVersion, targetDir: settings.gameDir });
       if (installedVersion !== settings.localVersion) persistSettings({ ...settings, localVersion: installedVersion });
+      setStatus(t('preparingLauncherUpdate'));
       await invoke('prepare_game_files', { gameDir: settings.gameDir });
       setProgress(null); setStatus(t('ready'));
       return true;
@@ -64,10 +112,11 @@ export default function App() {
   const play = async () => {
     if (!account || busy) return;
     setBusy(true);
+    setStatus(t('checkingUpdates'));
     try {
       if (!(await prepare())) return;
       setStatus(t('launching'));
-      await invoke('launch_minecraft', { username: account.username, ramMb: effectiveRam(settings, memory), gameDir: settings.gameDir });
+      await invoke('launch_minecraft', { username: account.username, ramMb: effectiveRam(settings, memory), gameDir: settings.gameDir, accessToken: account.passHash });
       invoke('link_ip_to_account', { username: account.username }).catch(() => undefined);
       gameRunning.current = true;
       setStatus(t('gameStarted'));
@@ -121,20 +170,67 @@ export default function App() {
 
     {!account ? <main className="content auth-content"><AuthScreen t={t} onDone={next => { saveAccount(next); setAccount(next); }} /></main> :
       <main className="content">
-        <section className="hero">
-          <div className="hero-kicker"><span /> {t('heroKicker')}</div>
-          <h1>{t('heroTitle1')}<br /><em>{t('heroTitle2')}</em></h1>
-          <p className="hero-copy">{t('heroCopy')}</p>
-          <div className="welcome-chip"><span className="avatar">{account.uuid ? <img src={`https://mc-heads.net/avatar/${account.uuid}/36`} alt="" /> : account.username.slice(0, 1).toUpperCase()}</span><div><small>{t('welcome')}</small><strong>{account.username}</strong></div></div>
-          <div className="pack-line">{t('packVersion')}: <b>{settings.localVersion === '0.0.0' ? '—' : `v${settings.localVersion}`}</b></div>
-          <button className="play-button" onClick={play} disabled={busy}><Play size={21} fill="currentColor" />{busy ? t('loading') : t('play')}<span /></button>
-          <ProgressBar percent={progress?.percent ?? 0} label={status ?? t('ready')} hidden={!progress && !status} />
-          <div className="security-note"><ShieldCheck size={16} /> {t('authNote')}</div>
-        </section>
-        <aside className="news">
-          <ServerCard t={t} server={server} />
-          <News t={t} lang={lang} />
-        </aside>
+        <nav className="main-tabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={activeTab === 'main'}
+            onClick={() => setActiveTab('main')}
+            className={`main-tab ${activeTab === 'main' ? 'active' : ''}`}
+          >
+            <Zap size={18} /> {t('heroKicker').replace('NEOFORGE EDITION', '').trim() || 'ГЛАВНАЯ'}
+          </button>
+          <button
+            role="tab"
+            aria-selected={activeTab === 'mods'}
+            onClick={() => setActiveTab('mods')}
+            className={`main-tab ${activeTab === 'mods' ? 'active' : ''}`}
+          >
+            <Puzzle size={18} /> {t('userMods')}
+          </button>
+          <button
+            role="tab"
+            aria-selected={activeTab === 'extra'}
+            onClick={() => setActiveTab('extra')}
+            className={`main-tab ${activeTab === 'extra' ? 'active' : ''}`}
+          >
+            <FolderOpen size={18} /> {t('extraMods')}
+          </button>
+        </nav>
+
+        {activeTab === 'main' && (
+          <section className="hero">
+            <div className="hero-kicker"><span /> {t('heroKicker')}</div>
+            <h1>{t('heroTitle1')}<br /><em>{t('heroTitle2')}</em></h1>
+            <p className="hero-copy">{t('heroCopy')}</p>
+            <div className="welcome-chip"><span className="avatar">{account.uuid ? <img src={`https://mc-heads.net/avatar/${account.uuid}/36`} alt="" /> : account.username.slice(0, 1).toUpperCase()}</span><div><small>{t('welcome')}</small><strong>{account.username}</strong></div></div>
+            <div className="pack-line">{t('packVersion')}: <b>{settings.localVersion === '0.0.0' ? '—' : `v${settings.localVersion}`}</b></div>
+            <button className="play-button" onClick={play} disabled={busy} aria-busy={busy}>
+              {busy ? <Loader2 size={21} className="spin" /> : <Play size={21} fill="currentColor" />}
+              {busy ? t('loading') : t('play')}<span />
+            </button>
+            {(progress || status) && <ProgressBar percent={progress?.percent ?? 0} label={status ?? t('ready')} />}
+            <div className="security-note"><ShieldCheck size={16} /> {t('authNote')}</div>
+          </section>
+        )}
+
+        {activeTab === 'mods' && (
+          <section className="mods-section">
+            <UserMods t={t} gameDir={settings.gameDir} />
+          </section>
+        )}
+
+        {activeTab === 'extra' && (
+          <section className="mods-section">
+            <ModrinthBrowser t={t} gameDir={settings.gameDir} gameVersion="1.21.1" loader="neoforge" />
+          </section>
+        )}
+
+        {activeTab === 'main' && (
+          <aside className="news">
+            <ServerCard t={t} server={server} />
+            <News t={t} lang={lang} />
+          </aside>
+        )}
       </main>}
 
     <footer><span>GORIZONT LAUNCHER <b>v{version}</b></span><span><Download size={14} /> {t('autoUpdate')}</span></footer>
