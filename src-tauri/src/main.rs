@@ -633,6 +633,8 @@ fn verify_integrity_manifest(
     for (rel_path, expected_hash) in &manifest.files {
         let file_path = game_path.join(rel_path);
         if !file_path.exists() {
+            // A mod the player disabled or removed on purpose is not corruption: skip it, do not reinstall the pack.
+            if rel_path.replace('\\', "/").starts_with("mods/") { continue; }
             return Err(format!("File missing: {}", rel_path));
         }
         let actual_hash = compute_file_sha256(&file_path)?;
