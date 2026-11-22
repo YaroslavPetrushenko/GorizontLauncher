@@ -1,0 +1,40 @@
+name: GorizontAuthPlugin
+version: 1.0.0
+main: com.gorizont.authplugin.GorizontAuthPlugin
+api-version: 1.21
+author: GorizontLauncher Team
+description: JWT-based authentication for Gorizont Launcher - protects server from unauthorized access
+website: https://github.com/GorizontLauncher
+
+commands:
+  login:
+    description: Login with nickname and password
+    usage: /login <password>
+    permission: gorizontauth.login
+  register:
+    description: Register new account with nickname and password
+    usage: /register <password> <confirmPassword>
+    permission: gorizontauth.register
+  logout:
+    description: Logout from current session
+    usage: /logout
+    permission: gorizontauth.logout
+  gorizontauth:
+    description: Main plugin command for admin functions
+    usage: /gorizontauth <reload|status|unlock <player>>
+    permission: gorizontauth.admin
+    aliases: [gauth]
+
+permissions:
+  gorizontauth.login:
+    description: Allows player to use /login
+    default: true
+  gorizontauth.register:
+    description: Allows player to use /register
+    default: true
+  gorizontauth.logout:
+    description: Allows player to use /logout
+    default: true
+  gorizontauth.admin:
+    description: Allows admin commands
+    default: op
