@@ -13,6 +13,19 @@ import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerLoginEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
+import org.bukkit.Location;
+import org.bukkit.event.Cancellable;
+import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
@@ -195,11 +208,11 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         }
 
         authenticatedPlayers.remove(key);
-        player.sendMessage(PREFIX + "§eВы вошли не через наш лаунчер, нужна регистрация на сервере.");
-        player.sendMessage(PREFIX + "§fНовый аккаунт: §e/register <пароль> <пароль>");
-        player.sendMessage(PREFIX + "§fУже регистрировались: §e/login <пароль>");
         if (forceLoginOnJoin) {
-            player.sendMessage(PREFIX + "§7Без входа вы не сможете играть.");
+            // The client is not ready in PlayerJoinEvent yet, so the prompt is sent a little later and repeated.
+            startLoginReminder(player);
+        } else {
+            sendLoginPrompt(player);
         }
     }
 
@@ -208,6 +221,105 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         String key = event.getPlayer().getName().toLowerCase();
         authenticatedPlayers.remove(key);
         loginAttempts.remove(key);
+    }
+
+    // ==================== LOGIN GATE ====================
+
+    /** True while a player must still log in: only /login and /register are allowed. */
+    private boolean needsLogin(Player player) {
+        return enableAuth && forceLoginOnJoin && !authenticatedPlayers.contains(player.getName().toLowerCase());
+    }
+
+    private void sendLoginPrompt(Player player) {
+        player.sendMessage(PREFIX + "§eВы вошли не через наш лаунчер, нужна регистрация на сервере.");
+        player.sendMessage(PREFIX + "§fНовый аккаунт: §e/register <пароль> <пароль>");
+        player.sendMessage(PREFIX + "§fУже регистрировались: §e/login <пароль>");
+        player.sendMessage(PREFIX + "§7Без входа вы не сможете играть.");
+    }
+
+    private void startLoginReminder(Player player) {
+        final String name = player.getName();
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                Player p = Bukkit.getPlayerExact(name);
+                if (p == null || !p.isOnline() || !needsLogin(p)) {
+                    cancel();
+                    return;
+                }
+                sendLoginPrompt(p);
+            }
+        }.runTaskTimer(this, 40L, 200L); // first prompt after 2 s, then every 10 s
+    }
+
+    private void denyUntilLogin(Player player, Cancellable event) {
+        event.setCancelled(true);
+        player.sendMessage(PREFIX + "§cСначала войдите: §e/login <пароль>§c или §e/register <пароль> <пароль>");
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onMove(PlayerMoveEvent event) {
+        Player player = event.getPlayer();
+        if (!needsLogin(player)) return;
+        Location from = event.getFrom();
+        Location to = event.getTo();
+        if (to == null) return;
+        if (from.getX() != to.getX() || from.getY() != to.getY() || from.getZ() != to.getZ()) {
+            Location fixed = from.clone();
+            fixed.setYaw(to.getYaw());
+            fixed.setPitch(to.getPitch());
+            event.setTo(fixed);
+        }
+    }
+
+    @EventHandler
+    public void onCommand(PlayerCommandPreprocessEvent event) {
+        Player player = event.getPlayer();
+        if (!needsLogin(player)) return;
+        String cmd = event.getMessage().toLowerCase().split(" ")[0];
+        if (cmd.equals("/login") || cmd.equals("/l") || cmd.equals("/register") || cmd.equals("/reg")) return;
+        denyUntilLogin(player, event);
+    }
+
+    @EventHandler
+    public void onChat(AsyncPlayerChatEvent event) {
+        if (needsLogin(event.getPlayer())) denyUntilLogin(event.getPlayer(), event);
+    }
+
+    @EventHandler
+    public void onBlockBreak(BlockBreakEvent event) {
+        if (needsLogin(event.getPlayer())) denyUntilLogin(event.getPlayer(), event);
+    }
+
+    @EventHandler
+    public void onBlockPlace(BlockPlaceEvent event) {
+        if (needsLogin(event.getPlayer())) denyUntilLogin(event.getPlayer(), event);
+    }
+
+    @EventHandler
+    public void onInteract(PlayerInteractEvent event) {
+        if (needsLogin(event.getPlayer())) denyUntilLogin(event.getPlayer(), event);
+    }
+
+    @EventHandler
+    public void onInteractEntity(PlayerInteractEntityEvent event) {
+        if (needsLogin(event.getPlayer())) denyUntilLogin(event.getPlayer(), event);
+    }
+
+    @EventHandler
+    public void onDropItem(PlayerDropItemEvent event) {
+        if (needsLogin(event.getPlayer())) denyUntilLogin(event.getPlayer(), event);
+    }
+
+    @EventHandler
+    public void onInventoryOpen(InventoryOpenEvent event) {
+        if (event.getPlayer() instanceof Player p && needsLogin(p)) denyUntilLogin(p, event);
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onDamage(EntityDamageEvent event) {
+        // Players who have not logged in cannot take damage (mobs, void, fire).
+        if (event.getEntity() instanceof Player p && needsLogin(p)) event.setCancelled(true);
     }
 
     // ==================== RATE LIMITING ====================
