@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   Search, Loader2, Download, Ban, Check, AlertCircle, RefreshCw,
-  Unlock, ChevronDown, Package, ArrowDownToLine, ShieldAlert,
+  Unlock, ChevronDown, Package, ArrowDownToLine, ShieldAlert, Repeat,
 } from 'lucide-react';
 import type { Key, T } from '../i18n';
 import { isModerator } from '../config';
+import ModVersionPicker from './ModVersionPicker';
 
 /**
  * Backend contract (Tauri commands):
@@ -105,6 +106,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
   const [busyId, setBusyId] = useState<string | null>(null);
   const [modError, setModError] = useState<Record<string, string>>({});
   const [showBlocked, setShowBlocked] = useState(false);
+  const [picking, setPicking] = useState<{ projectId: string; title: string; iconUrl?: string | null } | null>(null);
   const [titles, setTitles] = useState<Record<string, string>>(() => loadTitles());
 
   const loadState = useCallback(async () => {
@@ -159,24 +161,8 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
     setSubmittedQuery(query.trim());
   };
 
-  const install = async (hit: ModrinthHit) => {
-    setBusyId(hit.projectId);
-    setModError(prev => ({ ...prev, [hit.projectId]: '' }));
-    try {
-      await invoke<string>('modrinth_install_mod', {
-        gameDir,
-        projectId: hit.projectId,
-        gameVersion,
-        loader,
-        asModerator: moderator,
-      });
-      setInstalled(prev => new Set(prev).add(hit.projectId));
-    } catch (e) {
-      setModError(prev => ({ ...prev, [hit.projectId]: String(e) }));
-    } finally {
-      setBusyId(null);
-    }
-  };
+  // Installing asks which version: the fitting ones are listed, the newest is marked.
+  const install = (hit: ModrinthHit) => setPicking({ projectId: hit.projectId, title: hit.title, iconUrl: hit.iconUrl });
 
   const setBlockedState = async (projectId: string, next: boolean, title?: string) => {
     if (!moderator) return;
@@ -208,18 +194,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
   };
 
   // The moderator can download a blocked mod straight from the blocked list.
-  const installById = async (projectId: string) => {
-    setBusyId(projectId);
-    setModError(prev => ({ ...prev, [projectId]: '' }));
-    try {
-      await invoke<string>('modrinth_install_mod', { gameDir, projectId, gameVersion, loader, asModerator: true });
-      setInstalled(prev => new Set(prev).add(projectId));
-    } catch (e) {
-      setModError(prev => ({ ...prev, [projectId]: String(e) }));
-    } finally {
-      setBusyId(null);
-    }
-  };
+  const installById = (projectId: string) => setPicking({ projectId, title: titles[projectId] || projectId });
 
   const blockedCount = blocked.size;
   const visibleBlocked = useMemo(() => Array.from(blocked), [blocked]);
@@ -343,10 +318,10 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                   <button
                     className="mr-btn primary"
                     onClick={() => install(hit)}
-                    disabled={isBusy || isInstalled}
+                    disabled={isBusy}
                   >
-                    {isBusy ? <Loader2 size={14} className="spin" /> : isInstalled ? <Check size={14} /> : <Download size={14} />}
-                    {isBusy ? t('mrInstalling') : isInstalled ? t('mrInstalled') : t('mrInstall')}
+                    {isBusy ? <Loader2 size={14} className="spin" /> : isInstalled ? <Repeat size={14} /> : <Download size={14} />}
+                    {isInstalled ? t('userModsChange') : t('mrInstall')}
                   </button>
                   {moderator && <button
                     className="mr-btn danger"
@@ -388,10 +363,10 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                   <button
                     className="mr-btn"
                     onClick={() => installById(projectId)}
-                    disabled={busyId === projectId || installed.has(projectId)}
+                    disabled={busyId === projectId}
                   >
-                    {installed.has(projectId) ? <Check size={14} /> : <Download size={14} />}
-                    {installed.has(projectId) ? t('mrInstalled') : t('mrInstall')}
+                    {installed.has(projectId) ? <Repeat size={14} /> : <Download size={14} />}
+                    {installed.has(projectId) ? t('userModsChange') : t('mrInstall')}
                   </button>
                   <button
                     className="mr-btn"
@@ -407,6 +382,22 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
           )
         )}
       </div>}
+
+      {picking && (
+        <ModVersionPicker
+          t={t}
+          gameDir={gameDir}
+          gameVersion={gameVersion}
+          loader={loader}
+          projectId={picking.projectId}
+          title={picking.title}
+          iconUrl={picking.iconUrl}
+          replacing={installed.has(picking.projectId)}
+          asModerator={moderator}
+          onClose={() => setPicking(null)}
+          onDone={() => { setInstalled(prev => new Set(prev).add(picking.projectId)); setPicking(null); }}
+        />
+      )}
 
       <p className="mr-footer">{t('mrFooter')}</p>
     </div>

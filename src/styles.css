@@ -278,3 +278,44 @@ footer{height:44px;display:flex;align-items:center;justify-content:space-between
 }
 .avatar-head{image-rendering:pixelated;image-rendering:crisp-edges;object-fit:cover}
 .avatar{flex:0 0 36px;aspect-ratio:1}
+
+/* ---- mod version picker ---- */
+.mv-overlay{position:fixed;inset:0;z-index:60;display:grid;place-items:center;padding:20px;background:#000000b3;backdrop-filter:blur(3px)}
+.mv-dialog{width:min(540px,100%);max-height:calc(100vh - 40px);display:flex;flex-direction:column;gap:12px;padding:18px;border:1px solid #2b2b2b;border-radius:14px;background:#0f0f0f;box-shadow:0 20px 60px #000c}
+.mv-head{display:flex;align-items:center;gap:12px}
+.mv-head-text{min-width:0;flex:1}
+.mv-head-text h3{margin:0;font-size:15px;color:#f4f4f5}
+.mv-head-text span{display:block;margin-top:2px;font-size:11px;color:#a1a1aa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mv-close{width:30px;height:30px;display:grid;place-items:center;border:1px solid #2b2b2b;border-radius:7px;background:#111;color:#a1a1aa;cursor:pointer}
+.mv-close:hover:not(:disabled){border-color:#facc15;color:#facc15}
+.mv-error{margin:0;padding:9px 11px;border-radius:8px;background:#ef444418;border:1px solid #ef444455;color:#fca5a5;font-size:11px;line-height:1.4;overflow-wrap:anywhere}
+.mv-state{display:flex;align-items:center;justify-content:center;gap:10px;padding:26px;color:#a1a1aa;font-size:12px}
+.mv-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px;overflow-y:auto;min-height:0}
+.mv-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid #2b2b2b;border-radius:10px;background:#131313}
+.mv-item.current{border-color:#22c55e40}
+.mv-item-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}
+.mv-item-title{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px;color:#f4f4f5}
+.mv-item-sub{font-size:10px;color:#71717a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mv-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:99px;font-size:9px;font-weight:800;border:1px solid #3f3f46;color:#a1a1aa}
+.mv-chip.latest{color:#facc15;border-color:#facc1566;background:#facc1514}
+.mv-chip.current{color:#86efac;border-color:#22c55e55;background:#22c55e18}
+.mv-chip.beta{color:#fdba74;border-color:#fb923c55}
+.mv-chip.alpha{color:#fca5a5;border-color:#ef444455}
+.mv-item .mr-btn{flex:0 0 auto;min-width:104px}
+.mv-foot{margin:0;font-size:10px;line-height:1.5;color:#71717a}
+
+/* ---- "My mods" cards ---- */
+.user-mods-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.um-card{display:flex;flex-direction:column;gap:10px;padding:14px;border:1px solid #2b2b2b;border-radius:11px;background:linear-gradient(180deg,#131313,#0e0e0e);transition:border-color .15s ease}
+.um-card:hover{border-color:#3f3f46}
+.um-card.off{opacity:.62}
+.um-top{display:flex;align-items:center;gap:11px;min-width:0}
+.um-top .mr-icon{width:44px;height:44px}
+.um-head{min-width:0;flex:1}
+.um-head h3{margin:0;font-size:14px;color:#f4f4f5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.um-sub{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px}
+.um-ver{padding:2px 7px;border-radius:5px;background:#facc1514;border:1px solid #facc1540;color:#facc15;font-size:10px;font-weight:700}
+.um-desc{margin:0;font-size:11px;line-height:1.5;color:#a1a1aa;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.um-actions{display:flex;gap:7px;align-items:center;margin-top:auto}
+.um-actions .mr-btn{flex:1}
+.um-actions .mod-action-btn{width:32px;height:32px;flex:0 0 auto}

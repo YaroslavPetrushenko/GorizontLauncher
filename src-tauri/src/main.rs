@@ -207,7 +207,7 @@ struct FileIntegrityManifest {
 }
 
 /// User mod entry: a mod installed by the user that should persist across updates
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
 struct UserMod {
     /// Unique identifier (filename without .jar)
     id: String,
@@ -223,6 +223,20 @@ struct UserMod {
     display_name: Option<String>,
     /// Mod version (optional)
     version: Option<String>,
+    /// Modrinth project this mod belongs to, with what the card shows.
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    icon_url: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+    /// The file was put into the mods folder by the player (and recognised on Modrinth), not downloaded in the launcher.
+    #[serde(default)]
+    manual: bool,
 }
 
 /// User mods manifest: stores all user-installed mods with their metadata
@@ -407,6 +421,7 @@ fn pack_mods_present(game_path: &Path) -> bool {
 /// record is unknown, so a missing record can never remove legitimate mods. Returns the names moved.
 fn quarantine_unknown_mods(game_path: &Path) -> Vec<String> {
     let Some(pack) = read_pack_mod_list(game_path) else { return Vec::new() };
+    if ADOPTION_FAILED.load(std::sync::atomic::Ordering::SeqCst) { return Vec::new(); }
     let downloaded: HashSet<String> = load_modrinth_state().installed.values().map(|i| i.filename.clone()).collect();
     let mods_dir = game_path.join("mods");
     let removed_dir = game_path.join("mods-removed");
@@ -545,13 +560,14 @@ fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
     // "My mods" are exactly the mods the player downloaded from the extra-mods section (remembered in the
     // Modrinth state). Mods of the modpack and files dropped into the folder by hand are not listed.
     let mut mods: HashMap<String, UserMod> = HashMap::new();
-    for installed in state.installed.values() {
+    for (project_id, installed) in state.installed.iter() {
         if pack_mods.contains(&installed.filename) { continue; }
         let active = mods_dir.join(&installed.filename);
         let parked = parked_dir.join(&installed.filename);
         let (path, enabled) = if active.is_file() { (active, true) } else if parked.is_file() { (parked, false) } else { continue };
         let id = installed.filename.strip_suffix(".jar").unwrap_or(&installed.filename).to_string();
         let previous = manifest.mods.get(&id);
+        let named = |value: &str| if value.trim().is_empty() { None } else { Some(value.to_string()) };
         mods.insert(id.clone(), UserMod {
             id,
             filename: installed.filename.clone(),
@@ -560,7 +576,13 @@ fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
             // Not an approval any more: every mod the player downloaded is kept across modpack updates.
             approved: true,
             display_name: previous.and_then(|m| m.display_name.clone()),
-            version: previous.and_then(|m| m.version.clone()).or_else(|| Some(installed.version_number.clone())),
+            version: named(&installed.version_number).or_else(|| previous.and_then(|m| m.version.clone())),
+            project_id: Some(project_id.clone()),
+            title: named(&installed.title),
+            description: named(&installed.description),
+            icon_url: installed.icon_url.clone(),
+            slug: named(&installed.slug),
+            manual: installed.manual,
         });
     }
     manifest.mods = mods;
@@ -1565,6 +1587,7 @@ async fn prepare_game_files(app: AppHandle, game_dir: String, version_override: 
 
     // Extras (neither pack mods nor the player's downloads) are removed before the game starts.
     ensure_pack_mods_list(&game_path).await;
+    adopt_manual_mods(&game_path).await;
     quarantine_unknown_mods(&game_path);
 
     if !version_id.is_empty() { ensure_loader(&app, &game_path, &loader).await?; }
@@ -1586,7 +1609,8 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     eprintln!("[LAUNCH] jar path: {:?}, exists={}", jar, jar.exists());
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
 
-    // A mod dropped in after the preparation is removed as well.
+    // A mod dropped in after the preparation is checked on Modrinth too; what is not accepted is removed.
+    adopt_manual_mods(&game_path).await;
     quarantine_unknown_mods(&game_path);
 
     // --- Java detection: version + architecture ---
@@ -1919,6 +1943,7 @@ async fn scan_user_mods_cmd(game_dir: String) -> Result<UserModsManifest, String
     let game_path = expand_windows_path(&game_dir);
     ensure_pack_mods_list(&game_path).await;
     let _ = refresh_moderation().await;
+    adopt_manual_mods(&game_path).await;
     scan_user_mods(&game_path)
 }
 
@@ -2137,6 +2162,7 @@ async fn download_extra_mod(app: AppHandle, game_dir: String, spec: ExtraModSpec
         approved: true,
         display_name: Some(spec.name.clone()),
         version: spec.version.clone(),
+        ..Default::default()
     });
     save_user_mods_manifest(&game_path, &manifest)?;
 
@@ -2238,6 +2264,18 @@ struct ModrinthFile {
 #[derive(Deserialize, Clone, Debug)]
 struct ModrinthVersion {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    version_type: String,
+    #[serde(default)]
+    date_published: String,
+    #[serde(default)]
+    game_versions: Vec<String>,
+    #[serde(default)]
+    loaders: Vec<String>,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     version_number: String,
@@ -2255,12 +2293,22 @@ struct ModrinthState {
     installed: HashMap<String, InstalledProject>,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct InstalledProject {
     filename: String,
     #[serde(default)]
     version_number: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    icon_url: Option<String>,
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
+    manual: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -2269,6 +2317,20 @@ struct ExtraModsState {
     installed: Vec<String>,
     blocked: Vec<String>,
     titles: HashMap<String, String>,
+}
+
+/// What is remembered about an installed mod, from the Modrinth project description.
+fn installed_project(project: &serde_json::Value, filename: &str, version_number: &str, manual: bool) -> InstalledProject {
+    let text = |key: &str| project.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    InstalledProject {
+        filename: filename.to_string(),
+        version_number: version_number.to_string(),
+        title: text("title"),
+        description: text("description"),
+        icon_url: project.get("icon_url").and_then(|v| v.as_str()).map(str::to_string),
+        slug: text("slug"),
+        manual,
+    }
 }
 
 fn modrinth_state_path() -> Result<PathBuf, String> {
@@ -2403,7 +2465,70 @@ fn hide_blocked(hits: Vec<ModrinthHit>, blocked: &[String]) -> Vec<ModrinthHit> 
     hits.into_iter().filter(|hit| !blocked.contains(&hit.project_id)).collect()
 }
 
+/// One version offered to the player.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ModVersionInfo {
+    id: String,
+    version_number: String,
+    name: String,
+    /// release / beta / alpha
+    channel: String,
+    date_published: String,
+    filename: String,
+    size: u64,
+    /// The newest of the list (Modrinth returns them newest first).
+    latest: bool,
+    /// This version is the one that is installed now.
+    installed: bool,
+}
+
+/// All versions of a project that fit the pack's Minecraft version and loader, newest first.
+async fn modrinth_fitting_versions(client: &reqwest::Client, game_version: &str, loader: &str, project_id: &str) -> Result<Vec<ModrinthVersion>, String> {
+    let loaders_text = serde_json::json!([loader]).to_string();
+    let game_versions_text = serde_json::json!([game_version]).to_string();
+    let mut versions: Vec<ModrinthVersion> = client
+        .get(format!("{MODRINTH_API}/project/{project_id}/version"))
+        .header("User-Agent", MODRINTH_UA)
+        .query(&[("loaders", loaders_text.as_str()), ("game_versions", game_versions_text.as_str())])
+        .send().await
+        .map_err(|e| format!("Не удалось получить версии мода: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Версии мода недоступны: {e}"))?
+        .json().await
+        .map_err(|e| format!("Не удалось разобрать версии мода: {e}"))?;
+    versions.retain(|v| v.files.iter().any(|f| f.filename.to_lowercase().ends_with(".jar")));
+    versions.sort_by(|a, b| b.date_published.cmp(&a.date_published));
+    Ok(versions)
+}
+
+/// Versions of a mod the player may choose from. The installed one (if any) is marked.
+#[tauri::command]
+async fn modrinth_mod_versions(project_id: String, game_version: Option<String>, loader: Option<String>) -> Result<Vec<ModVersionInfo>, String> {
+    let (mc_version, config_loader) = pack_game_version(game_version)?;
+    let project_loader = loader.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or(config_loader);
+    let client = modrinth_client()?;
+    let versions = modrinth_fitting_versions(&client, &mc_version, &project_loader, &project_id).await?;
+    let installed_number = load_modrinth_state().installed.get(&project_id).map(|i| i.version_number.clone());
+    Ok(versions.iter().enumerate().map(|(index, v)| {
+        let file = v.files.iter().find(|f| f.primary && f.filename.to_lowercase().ends_with(".jar"))
+            .or_else(|| v.files.iter().find(|f| f.filename.to_lowercase().ends_with(".jar")));
+        ModVersionInfo {
+            id: v.id.clone(),
+            version_number: v.version_number.clone(),
+            name: v.name.clone(),
+            channel: if v.version_type.is_empty() { "release".into() } else { v.version_type.clone() },
+            date_published: v.date_published.clone(),
+            filename: file.map(|f| f.filename.clone()).unwrap_or_default(),
+            size: file.map(|f| f.size).unwrap_or(0),
+            latest: index == 0,
+            installed: installed_number.as_deref() == Some(v.version_number.as_str()),
+        }
+    }).collect())
+}
+
 /// Newest version of a project that has files for the pack's Minecraft version and loader.
+#[allow(dead_code)]
 async fn modrinth_pick_version(client: &reqwest::Client, game_version: &str, loader: &str, project_id: &str) -> Result<ModrinthVersion, String> {
     let loaders_text = serde_json::json!([loader]).to_string();
     let game_versions_text = serde_json::json!([game_version]).to_string();
@@ -2450,6 +2575,8 @@ async fn modrinth_install_mod(
     loader: Option<String>,
     overwrite: Option<bool>,
     as_moderator: Option<bool>,
+    version_id: Option<String>,
+    replace: Option<bool>,
 ) -> Result<String, String> {
     let overwrite = overwrite.unwrap_or(false);
     let (mc_version, config_loader) = pack_game_version(game_version)?;
@@ -2478,7 +2605,20 @@ async fn modrinth_install_mod(
     if !matches!(client_side, "required" | "optional") || !matches!(server_side, "optional" | "unsupported") {
         return Err("Можно скачивать только клиентские моды: этот мод нужен ещё и на сервере или не работает на клиенте".into());
     }
-    let version = modrinth_pick_version(&client, &mc_version, &project_loader, &project_id).await?;
+    // One version of a mod at a time: another one is installed only as an explicit replacement.
+    let previous = state.installed.get(&project_id).cloned();
+    if previous.is_some() && !replace.unwrap_or(false) {
+        let have = previous.as_ref().map(|p| p.version_number.clone()).unwrap_or_default();
+        return Err(format!("Этот мод уже установлен (версия {have}). Чтобы поставить другую версию, выберите «Сменить версию»"));
+    }
+    let fitting = modrinth_fitting_versions(&client, &mc_version, &project_loader, &project_id).await?;
+    let version = match version_id.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        // Only a version from the list of fitting ones can be chosen.
+        Some(wanted) => fitting.into_iter().find(|v| v.id == wanted)
+            .ok_or_else(|| format!("Версия мода не подходит для Minecraft {mc_version} и загрузчика {project_loader}"))?,
+        None => fitting.into_iter().next()
+            .ok_or_else(|| format!("Для Minecraft {mc_version} и загрузчика {project_loader} у этого мода нет файлов"))?,
+    };
     let file = version.files.iter()
         .find(|f| f.primary && f.filename.to_lowercase().ends_with(".jar"))
         .or_else(|| version.files.iter().find(|f| f.filename.to_lowercase().ends_with(".jar")))
@@ -2507,7 +2647,7 @@ async fn modrinth_install_mod(
             _ => false,
         };
         if matches {
-            state.installed.insert(project_id, InstalledProject { filename: file.filename.clone(), version_number: version.version_number.clone() });
+            state.installed.insert(project_id, installed_project(&project, &file.filename, &version.version_number, false));
             save_modrinth_state(&state)?;
             return Ok(file.filename.clone());
         }
@@ -2546,6 +2686,23 @@ async fn modrinth_install_mod(
     if target.exists() { fs::remove_file(&target).map_err(|e| format!("Не удалось заменить {}: {e}", file.filename))?; }
     fs::rename(&tmp, &target).map_err(|e| format!("Не удалось установить {}: {e}", file.filename))?;
 
+    // The replaced version goes away (active or switched off), and the new file keeps the old on/off state.
+    let mut was_off = false;
+    if let Some(old) = previous.as_ref().filter(|old| old.filename != file.filename) {
+        let _ = fs::remove_file(mods_dir.join(&old.filename));
+        let parked = game_path.join("mods-disabled").join(&old.filename);
+        if parked.is_file() { was_off = true; let _ = fs::remove_file(&parked); }
+        if let Ok(mut old_manifest) = load_user_mods_manifest(&game_path) {
+            old_manifest.mods.remove(old.filename.strip_suffix(".jar").unwrap_or(&old.filename));
+            let _ = save_user_mods_manifest(&game_path, &old_manifest);
+        }
+    }
+    if was_off {
+        let parked_dir = game_path.join("mods-disabled");
+        let _ = fs::create_dir_all(&parked_dir);
+        let _ = move_file(&target, &parked_dir.join(&file.filename));
+    }
+
     let mut manifest = load_user_mods_manifest(&game_path)?;
     let mod_id = file.filename.strip_suffix(".jar").unwrap_or(&file.filename).to_string();
     let display_name = if version.name.trim().is_empty() { file.filename.clone() } else { version.name.clone() };
@@ -2557,11 +2714,17 @@ async fn modrinth_install_mod(
         approved: true,
         display_name: Some(display_name),
         version: Some(version.version_number.clone()),
+        project_id: Some(project_id.clone()),
+        title: project.get("title").and_then(|v| v.as_str()).map(str::to_string),
+        description: project.get("description").and_then(|v| v.as_str()).map(str::to_string),
+        icon_url: project.get("icon_url").and_then(|v| v.as_str()).map(str::to_string),
+        slug: project.get("slug").and_then(|v| v.as_str()).map(str::to_string),
+        manual: false,
     });
     save_user_mods_manifest(&game_path, &manifest)?;
 
     state = load_modrinth_state();
-    state.installed.insert(project_id, InstalledProject { filename: file.filename.clone(), version_number: version.version_number });
+    state.installed.insert(project_id, installed_project(&project, &file.filename, &version.version_number, false));
     save_modrinth_state(&state)?;
 
     emit_progress(&app, "Готово", 1, Some(1));
@@ -2789,6 +2952,102 @@ async fn refresh_moderation() -> ModerationState {
     }
 }
 
+/// Set when Modrinth could not be asked about hand-placed jars: nothing is then removed as "unknown",
+/// so a missing network connection never costs a player a legitimate mod.
+static ADOPTION_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Projects by id (one request).
+async fn modrinth_projects(client: &reqwest::Client, ids: &[String]) -> Result<HashMap<String, serde_json::Value>, String> {
+    if ids.is_empty() { return Ok(HashMap::new()); }
+    let ids_text = serde_json::to_string(ids).map_err(|e| e.to_string())?;
+    let projects: Vec<serde_json::Value> = client.get(format!("{MODRINTH_API}/projects"))
+        .header("User-Agent", MODRINTH_UA)
+        .query(&[("ids", ids_text.as_str())])
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    Ok(projects.into_iter()
+        .filter_map(|p| p.get("id").and_then(|v| v.as_str()).map(str::to_string).map(|id| (id, p)))
+        .collect())
+}
+
+fn is_client_only_project(project: &serde_json::Value) -> bool {
+    let client_side = project.get("client_side").and_then(|v| v.as_str()).unwrap_or("");
+    let server_side = project.get("server_side").and_then(|v| v.as_str()).unwrap_or("");
+    matches!(client_side, "required" | "optional") && matches!(server_side, "optional" | "unsupported")
+}
+
+/// A mod the player put into `mods` by hand is looked up on Modrinth by the hash of the file. When it is a known
+/// client mod for this pack that is not blocked and whose project is not installed yet, it joins "My mods".
+/// Everything else stays an extra and is removed as usual. Also fills in names and icons of older records.
+async fn adopt_manual_mods(game_path: &Path) {
+    let Some(pack) = read_pack_mod_list(game_path) else { return };
+    let mut state = load_modrinth_state();
+    let known: HashSet<String> = state.installed.values().map(|i| i.filename.clone()).collect();
+    let mods_dir = game_path.join("mods");
+    let mut by_hash: HashMap<String, String> = HashMap::new();
+    if let Ok(entries) = fs::read_dir(&mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !path.is_file() || !name.to_lowercase().ends_with(".jar") || pack.contains(&name) || known.contains(&name) { continue; }
+            if let Ok(hash) = compute_file_sha512(&path) { by_hash.insert(hash, name); }
+        }
+    }
+    let untitled: Vec<String> = state.installed.iter().filter(|(_, i)| i.title.is_empty()).map(|(id, _)| id.clone()).collect();
+    if by_hash.is_empty() && untitled.is_empty() { ADOPTION_FAILED.store(false, std::sync::atomic::Ordering::SeqCst); return; }
+
+    let Ok(client) = modrinth_client() else { return };
+    let Ok((mc_version, loader)) = pack_game_version(None) else { return };
+    let mut found: HashMap<String, ModrinthVersion> = HashMap::new();
+    if !by_hash.is_empty() {
+        let hashes: Vec<&String> = by_hash.keys().collect();
+        let reply = client.post(format!("{MODRINTH_API}/version_files")).header("User-Agent", MODRINTH_UA)
+            .json(&serde_json::json!({ "hashes": hashes, "algorithm": "sha512" })).send().await;
+        match reply {
+            Ok(r) if r.status().is_success() => match r.json::<HashMap<String, ModrinthVersion>>().await {
+                Ok(map) => found = map,
+                Err(e) => { eprintln!("[MODS] bad hash lookup answer: {e}"); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
+            },
+            Ok(r) => { eprintln!("[MODS] hash lookup refused: {}", r.status()); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
+            Err(e) => { eprintln!("[MODS] hash lookup failed: {e}"); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
+        }
+    }
+    let mut wanted: Vec<String> = found.values().map(|v| v.project_id.clone()).collect();
+    wanted.extend(untitled);
+    wanted.sort();
+    wanted.dedup();
+    let projects = match modrinth_projects(&client, &wanted).await {
+        Ok(projects) => projects,
+        Err(e) => { eprintln!("[MODS] project lookup failed: {e}"); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
+    };
+    ADOPTION_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let blocked = refresh_moderation().await.blocked;
+
+    for (hash, version) in &found {
+        let Some(filename) = by_hash.get(hash) else { continue };
+        let Some(project) = projects.get(&version.project_id) else { continue };
+        let fits = version.game_versions.iter().any(|v| v == &mc_version) && version.loaders.iter().any(|l| l.eq_ignore_ascii_case(&loader));
+        if !fits || !is_client_only_project(project) || blocked.contains(&version.project_id) || state.installed.contains_key(&version.project_id) {
+            eprintln!("[MODS] hand-placed {filename} is not accepted (fits={fits}, project {})", version.project_id);
+            continue;
+        }
+        eprintln!("[MODS] hand-placed {filename} recognised on Modrinth, added to my mods");
+        state.installed.insert(version.project_id.clone(), installed_project(project, filename, &version.version_number, true));
+    }
+    for (id, installed) in state.installed.iter_mut() {
+        if !installed.title.is_empty() { continue; }
+        if let Some(project) = projects.get(id) {
+            let details = installed_project(project, &installed.filename, &installed.version_number, installed.manual);
+            installed.title = details.title;
+            installed.description = details.description;
+            installed.icon_url = details.icon_url;
+            installed.slug = details.slug;
+        }
+    }
+    let _ = save_modrinth_state(&state);
+}
+
 /// Catalog mods that a moderator has since blocked are moved out of `mods` (into `mods-blocked`).
 fn enforce_blocked_mods(game_path: &Path) {
     let Some(moderation) = load_moderation_cache() else { return };
@@ -2892,6 +3151,7 @@ fn main() {
             prepare_game_files,
             lookup_mojang_profile,
             get_player_skin,
+            modrinth_mod_versions,
             download_and_extract_modpack,
             check_and_update_modpack,
             check_launcher_update,
@@ -3000,7 +3260,7 @@ mod server_auth_tests {
         fs::write(game.join("mods/handmade.jar"), b"manual").unwrap();
         save_pack_mod_list(&game, &["pack-a-1.0.jar".to_string()].into_iter().collect());
         let mut state = ModrinthState::default();
-        state.installed.insert("MapProj1".into(), InstalledProject { filename: "mymap-1.0.jar".into(), version_number: "1.0".into() });
+        state.installed.insert("MapProj1".into(), InstalledProject { filename: "mymap-1.0.jar".into(), version_number: "1.0".into(), ..Default::default() });
         save_modrinth_state(&state).unwrap();
 
         // 1) only the catalog download is listed: not the pack mod, not the hand-made file
@@ -3054,7 +3314,7 @@ mod server_auth_tests {
         // 8) removing a downloaded mod deletes the file and the record
         fs::write(game.join("mods/other-1.0.jar"), b"other").unwrap();
         let mut state = load_modrinth_state();
-        state.installed.insert("OtherPro".into(), InstalledProject { filename: "other-1.0.jar".into(), version_number: "1.0".into() });
+        state.installed.insert("OtherPro".into(), InstalledProject { filename: "other-1.0.jar".into(), version_number: "1.0".into(), ..Default::default() });
         save_modrinth_state(&state).unwrap();
         assert!(scan_user_mods(&game).unwrap().mods.contains_key("other-1.0"));
         let manifest = tauri::async_runtime::block_on(remove_user_mod_tracking(game_dir, "other-1.0".into())).unwrap();
@@ -3107,7 +3367,7 @@ mod server_auth_tests {
 
         // the player downloaded a mod and then removed it: the pack is still fine
         let mut state = ModrinthState::default();
-        state.installed.insert("MyMod001".into(), InstalledProject { filename: "mine.jar".into(), version_number: "1".into() });
+        state.installed.insert("MyMod001".into(), InstalledProject { filename: "mine.jar".into(), version_number: "1".into(), ..Default::default() });
         save_modrinth_state(&state).unwrap();
         fs::write(game.join("mods/mine.jar"), b"mine").unwrap();
         assert!(pack_mods_present(&game));
@@ -3206,5 +3466,28 @@ mod server_auth_tests {
 
         match previous { Some(v) => env::set_var("LOCALAPPDATA", v), None => env::remove_var("LOCALAPPDATA") }
         let _ = fs::remove_dir_all(&root);
+    }
+    /// Network test against the real Modrinth: fitting versions are listed newest first, and a file is recognised
+    /// by its SHA-512 (what the recognition of hand-placed mods relies on).
+    #[test]
+    #[ignore]
+    fn lists_versions_and_recognises_a_file_by_hash() {
+        tauri::async_runtime::block_on(async {
+            let client = modrinth_client().unwrap();
+            let versions = modrinth_fitting_versions(&client, "1.21.1", "neoforge", "AANobbMI").await.unwrap();
+            assert!(versions.len() >= 2, "Sodium has several NeoForge 1.21.1 versions");
+            assert!(versions.windows(2).all(|w| w[0].date_published >= w[1].date_published), "newest first");
+            assert!(versions.iter().all(|v| v.loaders.iter().any(|l| l == "neoforge") && v.game_versions.iter().any(|g| g == "1.21.1")));
+            let older = &versions[1];
+            let hash = older.files.iter().find(|f| f.filename.ends_with(".jar")).and_then(|f| f.hashes.as_ref()).and_then(|h| h.sha512.clone()).unwrap();
+            let reply: HashMap<String, ModrinthVersion> = client.post(format!("{MODRINTH_API}/version_files")).header("User-Agent", MODRINTH_UA)
+                .json(&serde_json::json!({ "hashes": [hash.clone()], "algorithm": "sha512" })).send().await.unwrap().json().await.unwrap();
+            let found = reply.get(&hash).expect("the file is recognised");
+            assert_eq!(found.project_id, "AANobbMI");
+            assert_eq!(found.version_number, older.version_number);
+            let projects = modrinth_projects(&client, &["AANobbMI".to_string()]).await.unwrap();
+            assert!(is_client_only_project(&projects["AANobbMI"]));
+            assert!(!installed_project(&projects["AANobbMI"], "x.jar", "1", true).title.is_empty());
+        });
     }
 }

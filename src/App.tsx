@@ -218,7 +218,7 @@ export default function App() {
 
         {activeTab === 'mods' && (
           <section className="mods-section">
-            <UserMods t={t} gameDir={settings.gameDir} />
+            <UserMods t={t} gameDir={settings.gameDir} gameVersion="1.21.1" loader="neoforge" />
           </section>
         )}
 
