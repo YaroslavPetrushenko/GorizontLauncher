@@ -66,6 +66,13 @@
 
         <!-- HTTP Client (built into Java 11+) -->
         <!-- No additional dependency needed -->
+            <!-- Provided by the server at runtime: used only for the password log filter. -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <version>2.22.1</version>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
     <build>

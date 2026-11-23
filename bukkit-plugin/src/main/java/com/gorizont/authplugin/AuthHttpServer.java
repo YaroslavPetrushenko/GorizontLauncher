@@ -35,6 +35,7 @@ public final class AuthHttpServer {
     private static final long NONCE_TTL_MS = 5 * 60 * 1000L;
 
     private final Logger logger;
+    private final BruteForceGuard guard;
     private final AccountStore accounts;
     private final String hmacSecret;
     private final int maxSkewSeconds;
@@ -49,8 +50,9 @@ public final class AuthHttpServer {
     private final Map<String, Long> usedNonces = new ConcurrentHashMap<>();
 
     public AuthHttpServer(Logger logger, AccountStore accounts, String hmacSecret, int maxSkewSeconds,
-                          int rateLimitPerMinute, LauncherSessions sessions, int passwordMinLength) {
+                          int rateLimitPerMinute, LauncherSessions sessions, int passwordMinLength, BruteForceGuard guard) {
         this.logger = logger;
+        this.guard = guard;
         this.accounts = accounts;
         this.hmacSecret = hmacSecret == null ? "" : hmacSecret;
         this.maxSkewSeconds = Math.max(5, maxSkewSeconds);
@@ -98,7 +100,7 @@ public final class AuthHttpServer {
             switch (result) {
                 case REGISTERED -> {
                     reply.addProperty("status", "registered");
-                    sessions.authorize(nickname);
+                    sessions.authorize(nickname, ip);
                 }
                 case ALREADY_EXISTS -> {
                     reply.addProperty("status", "already_exists");
@@ -121,18 +123,28 @@ public final class AuthHttpServer {
         withSignedJson(exchange, (body, ip) -> {
             String nickname = stringField(body, "nickname");
             String password = stringField(body, "password");
+            long lockedMillis = guard.lockRemainingMillis(ip);
+            if (lockedMillis > 0) {
+                JsonObject lockedReply = new JsonObject();
+                lockedReply.addProperty("status", "locked");
+                lockedReply.addProperty("error", "Слишком много неудачных попыток. Повторите через " + Math.max(1, lockedMillis / 60_000L) + " мин.");
+                return lockedReply;
+            }
             AccountStore.LoginResult result = accounts.login(nickname, password);
             JsonObject reply = new JsonObject();
             switch (result) {
                 case OK -> {
                     reply.addProperty("status", "ok");
-                    sessions.authorize(nickname);
+                    guard.recordSuccess(ip);
+                    sessions.authorize(nickname, ip);
                 }
                 case INVALID_PASSWORD -> {
+                    guard.recordFailure(ip);
                     reply.addProperty("status", "invalid_password");
                     reply.addProperty("error", "Неверный пароль");
                 }
                 case NOT_FOUND -> {
+                    guard.recordFailure(ip);
                     reply.addProperty("status", "not_found");
                     reply.addProperty("error", "Пользователь не найден");
                 }
@@ -171,7 +183,7 @@ public final class AuthHttpServer {
             reply.addProperty("authorized", false);
             reply.addProperty("reason", "nickname is required");
         } else {
-            boolean authorized = sessions.isAuthorized(safeNickname);
+            boolean authorized = sessions.isAuthorized(safeNickname, null);
             reply.addProperty("authorized", authorized);
             if (!authorized) {
                 reply.addProperty("reason", "no launcher session for this nickname");

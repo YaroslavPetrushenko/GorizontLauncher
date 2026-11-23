@@ -15,57 +15,77 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 /**
- * Remembers which nicknames were authorised by a successful, signed launcher
- * login/registration, for a limited time.
+ * Remembers which nicknames were authorised by a successful, signed launcher login/registration,
+ * for a limited time, together with the IP address the launcher request came from.
  *
- * A player whose nickname is in this list joins without /login. The list is stored on
- * disk so a server restart does not force every launcher player to log in again.
+ * A player joins without /login only if the nickname has a live session AND connects from that same
+ * address (when binding is on, which is the default). Without the address check, anybody who knows a
+ * launcher player's nickname could join under it with a cracked client for the whole session.
+ * The sessions are stored on disk so a server restart does not force every launcher player to log in again.
  */
 public final class LauncherSessions {
+
+    private static final class Session {
+        final long until;
+        final String ip;
+        Session(long until, String ip) { this.until = until; this.ip = ip == null ? "" : ip; }
+    }
 
     private final Logger logger;
     private final Path file;
     private final long sessionMillis;
-    private final Map<String, Long> authorizedUntil = new ConcurrentHashMap<>();
+    private volatile boolean bindToIp;
+    private final Map<String, Session> sessions = new ConcurrentHashMap<>();
 
-    public LauncherSessions(File dataFolder, long sessionMinutes, Logger logger) {
+    public LauncherSessions(File dataFolder, long sessionMinutes, boolean bindToIp, Logger logger) {
         this.logger = logger;
         this.sessionMillis = Math.max(1, sessionMinutes) * 60_000L;
+        this.bindToIp = bindToIp;
         this.file = new File(dataFolder, "launcher_sessions.json").toPath();
         load();
+    }
+
+    public void setBindToIp(boolean bindToIp) {
+        this.bindToIp = bindToIp;
     }
 
     private static String key(String nickname) {
         return nickname.toLowerCase(Locale.ROOT);
     }
 
-    public void authorize(String nickname) {
+    /** Opens a session for the nickname, valid from the given address. */
+    public void authorize(String nickname, String ip) {
         if (nickname == null || nickname.isBlank()) return;
-        authorizedUntil.put(key(nickname), System.currentTimeMillis() + sessionMillis);
+        sessions.put(key(nickname), new Session(System.currentTimeMillis() + sessionMillis, ip));
         save();
     }
 
-    public boolean isAuthorized(String nickname) {
+    /**
+     * True if the nickname has a live session. When binding is on and {@code ip} is given, the address must
+     * be the one the session was opened from. Pass {@code null} to ignore the address.
+     */
+    public boolean isAuthorized(String nickname, String ip) {
         if (nickname == null || nickname.isBlank()) return false;
-        Long until = authorizedUntil.get(key(nickname));
-        if (until == null) return false;
-        if (until <= System.currentTimeMillis()) {
-            authorizedUntil.remove(key(nickname));
+        Session session = sessions.get(key(nickname));
+        if (session == null) return false;
+        if (session.until <= System.currentTimeMillis()) {
+            sessions.remove(key(nickname));
             save();
             return false;
         }
+        if (bindToIp && ip != null && !ip.equals(session.ip)) return false;
         return true;
     }
 
     public void forget(String nickname) {
         if (nickname == null) return;
-        if (authorizedUntil.remove(key(nickname)) != null) save();
+        if (sessions.remove(key(nickname)) != null) save();
     }
 
     public int size() {
         long now = System.currentTimeMillis();
-        authorizedUntil.values().removeIf(until -> until <= now);
-        return authorizedUntil.size();
+        sessions.values().removeIf(s -> s.until <= now);
+        return sessions.size();
     }
 
     private void load() {
@@ -73,29 +93,37 @@ public final class LauncherSessions {
         try {
             String text = Files.readString(file, StandardCharsets.UTF_8);
             JsonObject root = JsonParser.parseString(text).getAsJsonObject();
-            JsonObject entries = root.has("authorizedUntil") ? root.getAsJsonObject("authorizedUntil") : new JsonObject();
+            // The old format (nickname -> expiry only, no address) is dropped on purpose: such sessions
+            // cannot be tied to an address and would be exactly the hole this class closes.
+            JsonObject entries = root.has("sessions") ? root.getAsJsonObject("sessions") : new JsonObject();
             long now = System.currentTimeMillis();
             for (String nickname : entries.keySet()) {
-                long until = entries.get(nickname).getAsLong();
-                if (until > now) authorizedUntil.put(key(nickname), until);
+                JsonObject entry = entries.getAsJsonObject(nickname);
+                long until = entry.get("until").getAsLong();
+                String ip = entry.has("ip") ? entry.get("ip").getAsString() : "";
+                if (until > now) sessions.put(key(nickname), new Session(until, ip));
             }
-            logger.info("Loaded " + authorizedUntil.size() + " launcher session(s)");
+            logger.info("Loaded " + sessions.size() + " launcher session(s)");
         } catch (IOException | RuntimeException e) {
             logger.warning("Failed to read launcher_sessions.json: " + e.getMessage());
         }
     }
 
-    private void save() {
+    private synchronized void save() {
         try {
             JsonObject entries = new JsonObject();
             long now = System.currentTimeMillis();
-            long[] stamp = new long[]{now};
-            authorizedUntil.forEach((nickname, until) -> {
-                if (until > stamp[0]) entries.addProperty(nickname, until);
+            sessions.forEach((nickname, session) -> {
+                if (session.until > now) {
+                    JsonObject entry = new JsonObject();
+                    entry.addProperty("until", session.until);
+                    entry.addProperty("ip", session.ip);
+                    entries.add(nickname, entry);
+                }
             });
             JsonObject root = new JsonObject();
-            root.addProperty("schemaVersion", 1);
-            root.add("authorizedUntil", entries);
+            root.addProperty("schemaVersion", 2);
+            root.add("sessions", entries);
 
             Path parent = file.getParent();
             if (parent != null) Files.createDirectories(parent);

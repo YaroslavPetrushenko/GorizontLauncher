@@ -1,32 +1,33 @@
 package com.gorizont.authplugin;
 
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
+import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
-import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
-import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerLoginEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.event.player.PlayerMoveEvent;
-import org.bukkit.event.player.PlayerCommandPreprocessEvent;
-import org.bukkit.event.player.AsyncPlayerChatEvent;
-import org.bukkit.event.player.PlayerInteractEvent;
-import org.bukkit.event.player.PlayerInteractEntityEvent;
-import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.inventory.InventoryOpenEvent;
-import org.bukkit.Location;
-import org.bukkit.event.Cancellable;
-import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerLoginEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
 
 import java.io.File;
 import java.io.IOException;
@@ -34,7 +35,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -47,9 +47,13 @@ import java.util.logging.Level;
  * Server-side authentication for Gorizont Launcher.
  *
  * The plugin owns the account database and the HTTP API on the launcher port (default 22754).
- * The launcher sends signed registration/login requests there. A successful signed request marks
- * the nickname as launcher-authorised, so that player joins without /login. Everybody else —
- * third-party launchers and cracked clients — has to use /register and /login in game.
+ * The launcher sends signed registration/login requests there. A successful signed request opens a session for
+ * the nickname FROM THE ADDRESS OF THAT REQUEST, so the player joins without /login only from that address.
+ * Everybody else - third-party launchers and cracked clients - has to use /register and /login in game.
+ *
+ * Protection: brute-force lockouts by IP with escalating duration (shared with the API), sessions bound to
+ * the IP, a login timeout, no actions before login, protection against taking over an online nickname,
+ * password checks off the main thread, and passwords kept out of the server log.
  */
 public class GorizontAuthPlugin extends JavaPlugin implements Listener {
 
@@ -65,16 +69,21 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
     private int passwordMinLength;
     private int maxLoginAttempts;
     private long lockoutDurationMinutes;
+    private long maxLockoutMinutes;
     private long launcherSessionMinutes;
     private boolean forceLoginOnJoin;
+    private int loginTimeoutSeconds;
+    private boolean bindSessionToIp;
+    private boolean rememberIngameLogin;
+    private boolean blockSameNameTakeover;
+    private boolean hidePasswordsInLog;
 
     // State
     private AccountStore accounts;
     private LauncherSessions sessions;
+    private BruteForceGuard guard;
     private AuthHttpServer httpServer;
 
-    private final Map<String, Integer> loginAttempts = new ConcurrentHashMap<>();
-    private final Map<String, Long> lockedUntil = new ConcurrentHashMap<>();
     private final Set<String> authenticatedPlayers = ConcurrentHashMap.newKeySet();
 
     private ScheduledExecutorService scheduler;
@@ -85,17 +94,26 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         reloadLocalConfig();
 
         accounts = new AccountStore(getDataFolder(), passwordMinLength, getLogger());
-        sessions = new LauncherSessions(getDataFolder(), launcherSessionMinutes, getLogger());
+        sessions = new LauncherSessions(getDataFolder(), launcherSessionMinutes, bindSessionToIp, getLogger());
 
         getServer().getPluginManager().registerEvents(this, this);
 
         Objects.requireNonNull(getCommand("login")).setExecutor(new LoginCommand());
         Objects.requireNonNull(getCommand("register")).setExecutor(new RegisterCommand());
         Objects.requireNonNull(getCommand("logout")).setExecutor(new LogoutCommand());
+        Objects.requireNonNull(getCommand("changepassword")).setExecutor(new ChangePasswordCommand());
         Objects.requireNonNull(getCommand("gorizontauth")).setExecutor(new AdminCommand());
 
         scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(this::cleanupExpiredLocks, 1, 1, TimeUnit.MINUTES);
+        scheduler.scheduleAtFixedRate(() -> guard.cleanup(), 1, 1, TimeUnit.MINUTES);
+
+        if (hidePasswordsInLog) {
+            try {
+                PasswordLogFilter.install();
+            } catch (LinkageError | RuntimeException e) {
+                getLogger().warning("Could not install the password log filter, commands with passwords may appear in the log: " + e);
+            }
+        }
 
         startApi();
 
@@ -114,12 +132,13 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         if (scheduler != null) {
             scheduler.shutdownNow();
         }
+        PasswordLogFilter.deactivate();
         getLogger().info("Gorizont Auth Plugin disabled!");
     }
 
     private void startApi() {
         try {
-            httpServer = new AuthHttpServer(getLogger(), accounts, hmacSecret, signatureMaxSkewSeconds, rateLimitPerMinute, sessions, passwordMinLength);
+            httpServer = new AuthHttpServer(getLogger(), accounts, hmacSecret, signatureMaxSkewSeconds, rateLimitPerMinute, sessions, passwordMinLength, guard);
             httpServer.start(apiHost, apiPort);
             if (!httpServer.isSigningConfigured()) {
                 getLogger().warning("auth.hmacSecret is empty — every launcher request will be rejected until it matches the launcher key");
@@ -133,6 +152,13 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
     private void reloadLocalConfig() {
         reloadConfig();
         FileConfiguration config = getConfig();
+        config.addDefault("auth.maxLockoutMinutes", 1440);
+        config.addDefault("auth.loginTimeoutSeconds", 60);
+        config.addDefault("auth.bindSessionToIp", true);
+        config.addDefault("auth.rememberIngameLogin", true);
+        config.addDefault("auth.blockSameNameTakeover", true);
+        config.addDefault("auth.hidePasswordsInLog", true);
+
         enableAuth = config.getBoolean("auth.enableAuth", true);
         apiHost = config.getString("auth.apiHost", "0.0.0.0");
         apiPort = config.getInt("auth.apiPort", 22754);
@@ -142,10 +168,19 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         passwordMinLength = Math.max(1, config.getInt("auth.passwordMinLength", 4));
         maxLoginAttempts = config.getInt("auth.maxLoginAttempts", 5);
         lockoutDurationMinutes = config.getLong("auth.lockoutDurationMinutes", 15);
+        maxLockoutMinutes = config.getLong("auth.maxLockoutMinutes", 1440);
         launcherSessionMinutes = config.getLong("auth.launcherSessionMinutes", 720);
         forceLoginOnJoin = config.getBoolean("auth.forceLoginOnJoin", true);
+        loginTimeoutSeconds = Math.max(0, config.getInt("auth.loginTimeoutSeconds", 60));
+        bindSessionToIp = config.getBoolean("auth.bindSessionToIp", true);
+        rememberIngameLogin = config.getBoolean("auth.rememberIngameLogin", true);
+        blockSameNameTakeover = config.getBoolean("auth.blockSameNameTakeover", true);
+        hidePasswordsInLog = config.getBoolean("auth.hidePasswordsInLog", true);
         config.options().copyDefaults(true);
         saveConfig();
+
+        guard = new BruteForceGuard(maxLoginAttempts, lockoutDurationMinutes, maxLockoutMinutes);
+        if (sessions != null) sessions.setBindToIp(bindSessionToIp);
     }
 
     @Override
@@ -162,10 +197,27 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         config.set("auth.passwordMinLength", 4);
         config.set("auth.maxLoginAttempts", 5);
         config.set("auth.lockoutDurationMinutes", 15);
+        config.set("auth.maxLockoutMinutes", 1440);
         config.set("auth.launcherSessionMinutes", 720);
         config.set("auth.forceLoginOnJoin", true);
+        config.set("auth.loginTimeoutSeconds", 60);
+        config.set("auth.bindSessionToIp", true);
+        config.set("auth.rememberIngameLogin", true);
+        config.set("auth.blockSameNameTakeover", true);
+        config.set("auth.hidePasswordsInLog", true);
         config.options().copyDefaults(true);
         saveConfig();
+    }
+
+    // ==================== HELPERS ====================
+
+    private static String ipOf(Player player) {
+        var address = player.getAddress();
+        return address == null || address.getAddress() == null ? "unknown" : address.getAddress().getHostAddress();
+    }
+
+    private static String minutesLeft(long millis) {
+        return String.valueOf(Math.max(1, (millis + 59_999L) / 60_000L));
     }
 
     // ==================== EVENTS ====================
@@ -174,23 +226,41 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
     public void onAsyncPreLogin(AsyncPlayerPreLoginEvent event) {
         if (!enableAuth) return;
         String nickname = event.getName();
-        // The session was created by a signed launcher login, so no in-game password is needed.
-        // It is checked here, before the player is spawned, and consumed on join.
-        if (sessions.isAuthorized(nickname)) {
-            getLogger().info("Player " + nickname + " authorised by launcher session");
+        String ip = event.getAddress().getHostAddress();
+        if (sessions.isAuthorized(nickname, ip)) {
+            getLogger().info("Player " + nickname + " has a launcher session from this address");
         } else {
-            getLogger().info("Player " + nickname + " has no launcher session, /login or /register required");
+            getLogger().info("Player " + nickname + " has no launcher session from this address, /login or /register required");
         }
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.LOWEST)
     public void onPlayerLogin(PlayerLoginEvent event) {
         if (!enableAuth) return;
-        String username = event.getPlayer().getName();
-        if (isLockedOut(username)) {
-            long remaining = Math.max(1, (lockedUntil.get(username.toLowerCase()) - System.currentTimeMillis()) / 1000 / 60);
+        Player player = event.getPlayer();
+        String username = player.getName();
+        String ip = event.getAddress().getHostAddress();
+
+        if (!AccountStore.validNickname(username)) {
+            event.disallow(PlayerLoginEvent.Result.KICK_OTHER, PREFIX + "§cНик: 3-16 символов, латиница, цифры и _");
+            return;
+        }
+
+        long locked = guard.lockRemainingMillis(ip);
+        if (locked > 0) {
             event.disallow(PlayerLoginEvent.Result.KICK_OTHER,
-                PREFIX + "§cСлишком много неудачных попыток входа. Попробуйте через " + remaining + " мин.");
+                PREFIX + "§cСлишком много неудачных попыток входа. Попробуйте через " + minutesLeft(locked) + " мин.");
+            return;
+        }
+
+        // Without this check anybody could join under the nickname of an online player and the server would
+        // kick the real one ("logged in from another location").
+        if (blockSameNameTakeover) {
+            Player online = Bukkit.getPlayerExact(username);
+            if (online != null && online.isOnline() && !ipOf(online).equals(ip)) {
+                event.disallow(PlayerLoginEvent.Result.KICK_OTHER, PREFIX + "§cИгрок с этим ником уже на сервере.");
+                getLogger().warning("Refused a second connection for online nickname " + username + " from " + ip);
+            }
         }
     }
 
@@ -201,7 +271,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         String username = player.getName();
         String key = username.toLowerCase();
 
-        if (sessions.isAuthorized(username)) {
+        if (sessions.isAuthorized(username, ipOf(player))) {
             authenticatedPlayers.add(key);
             player.sendMessage(PREFIX + "§aВы вошли через Gorizont Launcher — авторизация пройдена.");
             return;
@@ -218,9 +288,9 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
-        String key = event.getPlayer().getName().toLowerCase();
-        authenticatedPlayers.remove(key);
-        loginAttempts.remove(key);
+        // Failed attempts belong to the IP and are deliberately NOT cleared here: reconnecting must not
+        // give a fresh set of guesses.
+        authenticatedPlayers.remove(event.getPlayer().getName().toLowerCase());
     }
 
     // ==================== LOGIN GATE ====================
@@ -250,6 +320,18 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                 sendLoginPrompt(p);
             }
         }.runTaskTimer(this, 40L, 200L); // first prompt after 2 s, then every 10 s
+
+        if (loginTimeoutSeconds > 0) {
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    Player p = Bukkit.getPlayerExact(name);
+                    if (p != null && p.isOnline() && needsLogin(p)) {
+                        p.kickPlayer(PREFIX + "§cВремя на вход вышло (" + loginTimeoutSeconds + " с). Зайдите снова и введите /login или /register.");
+                    }
+                }
+            }.runTaskLater(this, loginTimeoutSeconds * 20L);
+        }
     }
 
     private void denyUntilLogin(Player player, Cancellable event) {
@@ -322,39 +404,6 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         if (event.getEntity() instanceof Player p && needsLogin(p)) event.setCancelled(true);
     }
 
-    // ==================== RATE LIMITING ====================
-
-    private boolean isLockedOut(String username) {
-        String key = username.toLowerCase();
-        Long until = lockedUntil.get(key);
-        if (until != null && until > System.currentTimeMillis()) return true;
-        if (until != null) {
-            lockedUntil.remove(key);
-            loginAttempts.remove(key);
-        }
-        return false;
-    }
-
-    private void recordFailedAttempt(String username) {
-        String key = username.toLowerCase();
-        int attempts = loginAttempts.merge(key, 1, Integer::sum);
-        if (attempts >= maxLoginAttempts) {
-            lockedUntil.put(key, System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(lockoutDurationMinutes));
-            getLogger().warning("Player " + username + " locked out for " + lockoutDurationMinutes + " minutes after " + attempts + " failed attempts");
-        }
-    }
-
-    private void resetLoginAttempts(String username) {
-        String key = username.toLowerCase();
-        loginAttempts.remove(key);
-        lockedUntil.remove(key);
-    }
-
-    private void cleanupExpiredLocks() {
-        long now = System.currentTimeMillis();
-        lockedUntil.entrySet().removeIf(entry -> entry.getValue() <= now);
-    }
-
     // ==================== COMMANDS ====================
 
     private abstract class PlayerCommand implements CommandExecutor, TabCompleter {
@@ -364,9 +413,33 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
             return null;
         }
 
+        /** Password checks use BCrypt (about a quarter of a second): never run them on the main thread. */
+        protected void async(Runnable work, Runnable onMainThread) {
+            Bukkit.getScheduler().runTaskAsynchronously(GorizontAuthPlugin.this, () -> {
+                work.run();
+                Bukkit.getScheduler().runTask(GorizontAuthPlugin.this, onMainThread);
+            });
+        }
+
+        protected boolean stillOnline(Player player) {
+            Player current = Bukkit.getPlayerExact(player.getName());
+            return current != null && current.isOnline();
+        }
+
         @Override
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
             return Collections.emptyList();
+        }
+    }
+
+    /** Applies a wrong password: counts it for the IP and kicks when the address becomes locked. */
+    private void failedPassword(Player player, String ip) {
+        boolean locked = guard.recordFailure(ip);
+        if (locked) {
+            player.kickPlayer(PREFIX + "§cСлишком много неудачных попыток. Попробуйте через " + minutesLeft(guard.lockRemainingMillis(ip)) + " мин.");
+            getLogger().warning("Address " + ip + " locked out after wrong passwords (last nickname " + player.getName() + ")");
+        } else {
+            player.sendMessage(PREFIX + "§cНеверный пароль. Осталось попыток: " + guard.attemptsLeft(ip));
         }
     }
 
@@ -379,37 +452,38 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                 player.sendMessage(PREFIX + "§cИспользование: /login <пароль>");
                 return true;
             }
-            String username = player.getName();
-            if (authenticatedPlayers.contains(username.toLowerCase())) {
+            final String username = player.getName();
+            final String key = username.toLowerCase();
+            final String ip = ipOf(player);
+            if (authenticatedPlayers.contains(key)) {
                 player.sendMessage(PREFIX + "§aВы уже авторизованы!");
                 return true;
             }
-            if (isLockedOut(username)) {
-                long remaining = Math.max(1, (lockedUntil.get(username.toLowerCase()) - System.currentTimeMillis()) / 1000 / 60);
-                player.sendMessage(PREFIX + "§cСлишком много неудачных попыток. Попробуйте через " + remaining + " мин.");
+            long locked = guard.lockRemainingMillis(ip);
+            if (locked > 0) {
+                player.sendMessage(PREFIX + "§cСлишком много неудачных попыток. Попробуйте через " + minutesLeft(locked) + " мин.");
                 return true;
             }
-            String password = args[0];
-            AccountStore.LoginResult result = accounts.login(username, password);
-            switch (result) {
-                case OK -> {
-                    resetLoginAttempts(username);
-                    authenticatedPlayers.add(username.toLowerCase());
-                    player.sendMessage(PREFIX + "§aВход выполнен успешно! Добро пожаловать, " + username);
-                    getLogger().info("Player " + username + " logged in with the in-game password");
+            final String password = args[0];
+            final AccountStore.LoginResult[] result = new AccountStore.LoginResult[1];
+            async(() -> result[0] = accounts.login(username, password), () -> {
+                if (!stillOnline(player)) return;
+                switch (result[0]) {
+                    case OK -> {
+                        guard.recordSuccess(ip);
+                        authenticatedPlayers.add(key);
+                        if (rememberIngameLogin) sessions.authorize(username, ip);
+                        player.sendMessage(PREFIX + "§aВход выполнен успешно! Добро пожаловать, " + username);
+                        getLogger().info("Player " + username + " logged in with the in-game password");
+                    }
+                    case NOT_FOUND -> {
+                        guard.recordFailure(ip);
+                        player.sendMessage(PREFIX + "§cАккаунт не найден. Создайте его: §e/register <пароль> <пароль>");
+                    }
+                    case INVALID_PASSWORD, INVALID_INPUT -> failedPassword(player, ip);
+                    default -> player.sendMessage(PREFIX + "§cОшибка сервера, попробуйте позже.");
                 }
-                case INVALID_PASSWORD, INVALID_INPUT -> {
-                    recordFailedAttempt(username);
-                    int remaining = maxLoginAttempts - loginAttempts.getOrDefault(username.toLowerCase(), 0);
-                    player.sendMessage(PREFIX + "§cНеверный пароль. Осталось попыток: " + Math.max(0, remaining));
-                }
-                case NOT_FOUND -> {
-                    recordFailedAttempt(username);
-                    player.sendMessage(PREFIX + "§cНеверный пароль. Осталось попыток: "
-                        + Math.max(0, maxLoginAttempts - loginAttempts.getOrDefault(username.toLowerCase(), 0)));
-                }
-                default -> player.sendMessage(PREFIX + "§cОшибка сервера, попробуйте позже.");
-            }
+            });
             return true;
         }
     }
@@ -423,14 +497,15 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                 player.sendMessage(PREFIX + "§cИспользование: /register <пароль> <подтверждение>");
                 return true;
             }
-            String username = player.getName();
-            if (authenticatedPlayers.contains(username.toLowerCase())) {
+            final String username = player.getName();
+            final String key = username.toLowerCase();
+            final String ip = ipOf(player);
+            if (authenticatedPlayers.contains(key)) {
                 player.sendMessage(PREFIX + "§aВы уже авторизованы!");
                 return true;
             }
-            String password = args[0];
-            String confirmPassword = args[1];
-            if (!password.equals(confirmPassword)) {
+            final String password = args[0];
+            if (!password.equals(args[1])) {
                 player.sendMessage(PREFIX + "§cПароли не совпадают");
                 return true;
             }
@@ -438,23 +513,68 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                 player.sendMessage(PREFIX + "§cПароль должен быть не короче " + passwordMinLength + " символов");
                 return true;
             }
-            AccountStore.RegisterResult result = accounts.register(username, password);
-            switch (result) {
-                case REGISTERED -> {
-                    resetLoginAttempts(username);
-                    authenticatedPlayers.add(username.toLowerCase());
-                    sessions.authorize(username);
-                    player.sendMessage(PREFIX + "§aРегистрация успешна! Вы вошли как " + username);
-                    getLogger().info("Player " + username + " registered");
+            final AccountStore.RegisterResult[] result = new AccountStore.RegisterResult[1];
+            async(() -> result[0] = accounts.register(username, password), () -> {
+                if (!stillOnline(player)) return;
+                switch (result[0]) {
+                    case REGISTERED -> {
+                        authenticatedPlayers.add(key);
+                        if (rememberIngameLogin) sessions.authorize(username, ip);
+                        player.sendMessage(PREFIX + "§aРегистрация успешна! Вы вошли как " + username);
+                        getLogger().info("Player " + username + " registered");
+                    }
+                    case ALREADY_EXISTS -> {
+                        player.sendMessage(PREFIX + "§cТакой ник уже зарегистрирован. Используйте /login <пароль>");
+                        getLogger().info("Registration refused for " + username + ": nickname taken");
+                    }
+                    case INVALID_INPUT -> player.sendMessage(PREFIX
+                        + "§cНик: 3-16 символов (латиница, цифры, _); пароль не короче " + passwordMinLength + " символов");
+                    default -> player.sendMessage(PREFIX + "§cОшибка сервера, попробуйте позже.");
                 }
-                case ALREADY_EXISTS -> {
-                    player.sendMessage(PREFIX + "§cТакой ник уже зарегистрирован. Используйте /login <пароль>");
-                    getLogger().info("Registration refused for " + username + ": nickname taken");
-                }
-                case INVALID_INPUT -> player.sendMessage(PREFIX
-                    + "§cНик: 3-16 символов (латиница, цифры, _); пароль не короче " + passwordMinLength + " символов");
-                default -> player.sendMessage(PREFIX + "§cОшибка сервера, попробуйте позже.");
+            });
+            return true;
+        }
+    }
+
+    private class ChangePasswordCommand extends PlayerCommand {
+        @Override
+        public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+            Player player = asPlayer(sender);
+            if (player == null) return true;
+            final String username = player.getName();
+            if (!authenticatedPlayers.contains(username.toLowerCase())) {
+                player.sendMessage(PREFIX + "§cСначала войдите: §e/login <пароль>");
+                return true;
             }
+            if (args.length < 2) {
+                player.sendMessage(PREFIX + "§cИспользование: /changepassword <старый пароль> <новый пароль>");
+                return true;
+            }
+            final String ip = ipOf(player);
+            long locked = guard.lockRemainingMillis(ip);
+            if (locked > 0) {
+                player.sendMessage(PREFIX + "§cСлишком много неудачных попыток. Попробуйте через " + minutesLeft(locked) + " мин.");
+                return true;
+            }
+            if (args[1].length() < passwordMinLength) {
+                player.sendMessage(PREFIX + "§cНовый пароль должен быть не короче " + passwordMinLength + " символов");
+                return true;
+            }
+            final String oldPassword = args[0];
+            final String newPassword = args[1];
+            final AccountStore.LoginResult[] result = new AccountStore.LoginResult[1];
+            async(() -> result[0] = accounts.changePassword(username, oldPassword, newPassword), () -> {
+                if (!stillOnline(player)) return;
+                switch (result[0]) {
+                    case OK -> {
+                        player.sendMessage(PREFIX + "§aПароль изменён.");
+                        getLogger().info("Player " + username + " changed the password");
+                    }
+                    case INVALID_PASSWORD -> failedPassword(player, ip);
+                    case NOT_FOUND -> player.sendMessage(PREFIX + "§cУ этого ника нет аккаунта на сервере (вход был через лаунчер). Создайте пароль: §e/register");
+                    default -> player.sendMessage(PREFIX + "§cОшибка сервера, попробуйте позже.");
+                }
+            });
             return true;
         }
     }
@@ -481,7 +601,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                 return true;
             }
             if (args.length < 1) {
-                sender.sendMessage(PREFIX + "§e/gorizontauth <reload|status|unlock <player>>");
+                sender.sendMessage(PREFIX + "§e/gorizontauth <reload|status|unlock <ip|игрок>|unregister <игрок>>");
                 return true;
             }
             switch (args[0].toLowerCase()) {
@@ -497,22 +617,35 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                     sender.sendMessage("  API: " + apiHost + ":" + apiPort + (httpServer == null ? " (не запущен)" : " (работает)"));
                     sender.sendMessage("  HMAC secret: " + (hmacSecret != null && !hmacSecret.isEmpty() ? "SET" : "NOT SET"));
                     sender.sendMessage("  Accounts: " + accounts.size());
-                    sender.sendMessage("  Launcher sessions: " + sessions.size());
+                    sender.sendMessage("  Launcher sessions: " + sessions.size() + (bindSessionToIp ? " (привязаны к IP)" : " (БЕЗ привязки к IP)"));
                     sender.sendMessage("  Authenticated players: " + authenticatedPlayers.size());
-                    sender.sendMessage("  Locked players: " + lockedUntil.size());
+                    sender.sendMessage("  Locked addresses: " + guard.lockedCount());
                     break;
-                case "unlock":
+                case "unlock": {
                     if (args.length < 2) {
-                        sender.sendMessage(PREFIX + "§cИспользование: /gorizontauth unlock <player>");
+                        sender.sendMessage(PREFIX + "§cИспользование: /gorizontauth unlock <ip|игрок>");
                         return true;
                     }
-                    String target = args[1].toLowerCase();
-                    lockedUntil.remove(target);
-                    loginAttempts.remove(target);
-                    sender.sendMessage(PREFIX + "§aИгрок " + target + " разблокирован.");
+                    Player online = Bukkit.getPlayerExact(args[1]);
+                    String ip = online != null ? ipOf(online) : args[1];
+                    guard.unlock(ip);
+                    sender.sendMessage(PREFIX + "§aАдрес " + ip + " разблокирован.");
                     break;
+                }
+                case "unregister": {
+                    if (args.length < 2) {
+                        sender.sendMessage(PREFIX + "§cИспользование: /gorizontauth unregister <игрок>");
+                        return true;
+                    }
+                    boolean removed = accounts.remove(args[1]);
+                    sessions.forget(args[1]);
+                    authenticatedPlayers.remove(args[1].toLowerCase());
+                    sender.sendMessage(PREFIX + (removed ? "§aАккаунт " + args[1] + " удалён." : "§cАккаунта " + args[1] + " нет."));
+                    getLogger().info(sender.getName() + " unregistered " + args[1] + " (" + (removed ? "removed" : "not found") + ")");
+                    break;
+                }
                 default:
-                    sender.sendMessage(PREFIX + "§cНеизвестная подкоманда. Доступные: reload, status, unlock");
+                    sender.sendMessage(PREFIX + "§cНеизвестная подкоманда. Доступные: reload, status, unlock, unregister");
             }
             return true;
         }
@@ -520,9 +653,9 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         @Override
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
             if (args.length == 1) {
-                return Arrays.asList("reload", "status", "unlock");
+                return Arrays.asList("reload", "status", "unlock", "unregister");
             }
-            if (args.length == 2 && args[0].equalsIgnoreCase("unlock")) {
+            if (args.length == 2 && (args[0].equalsIgnoreCase("unlock") || args[0].equalsIgnoreCase("unregister"))) {
                 return new ArrayList<>(Bukkit.getOnlinePlayers().stream().map(Player::getName).toList());
             }
             return Collections.emptyList();

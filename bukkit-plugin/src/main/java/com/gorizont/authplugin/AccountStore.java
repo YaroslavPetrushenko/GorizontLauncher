@@ -107,6 +107,39 @@ public final class AccountStore {
         }
     }
 
+    /** Changes the password after checking the old one. Returns OK, INVALID_PASSWORD, NOT_FOUND, INVALID_INPUT or ERROR. */
+    public synchronized LoginResult changePassword(String nickname, String oldPassword, String newPassword) {
+        if (newPassword == null || newPassword.length() < passwordMinLength) return LoginResult.INVALID_INPUT;
+        LoginResult check = login(nickname, oldPassword);
+        if (check != LoginResult.OK) return check;
+        Account account = accounts.get(key(nickname));
+        String previous = account.hash;
+        try {
+            account.hash = BCrypt.hashpw(newPassword, BCrypt.gensalt(12));
+            save();
+            return LoginResult.OK;
+        } catch (RuntimeException | IOException e) {
+            logger.severe("Failed to change password of " + nickname + ": " + e.getMessage());
+            account.hash = previous;
+            return LoginResult.ERROR;
+        }
+    }
+
+    /** Admin removal of an account. Returns true if it existed. */
+    public synchronized boolean remove(String nickname) {
+        if (nickname == null) return false;
+        Account removed = accounts.remove(key(nickname));
+        if (removed == null) return false;
+        try {
+            save();
+        } catch (IOException e) {
+            logger.severe("Failed to save accounts after removing " + nickname + ": " + e.getMessage());
+            accounts.put(key(nickname), removed);
+            return false;
+        }
+        return true;
+    }
+
     synchronized boolean exists(String nickname) {
         return accounts.containsKey(key(nickname));
     }
