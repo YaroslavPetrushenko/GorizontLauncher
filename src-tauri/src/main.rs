@@ -2271,7 +2271,6 @@ struct InstalledProject {
 struct ExtraModsState {
     installed: Vec<String>,
     blocked: Vec<String>,
-    approved: Vec<String>,
     titles: HashMap<String, String>,
 }
 
@@ -2348,10 +2347,6 @@ async fn modrinth_search(
     limit: Option<u32>,
     as_moderator: Option<bool>,
 ) -> Result<ModrinthSearchResponse, String> {
-    // Everybody except the moderator only gets the mods a moderator approved for download.
-    if !as_moderator.unwrap_or(false) {
-        return modrinth_search_approved(query, game_version, loader, categories, index, offset, limit).await;
-    }
     let (mc_version, config_loader) = pack_game_version(game_version)?;
     let project_loader = loader.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or(config_loader);
     let client = modrinth_client()?;
@@ -2400,89 +2395,15 @@ async fn modrinth_search(
         })
         .collect();
 
+    // Blocked mods exist only for the moderator; everybody else never sees them.
+    let hits = if as_moderator.unwrap_or(false) { hits } else { hide_blocked(hits, &refresh_moderation().await.blocked) };
     Ok(ModrinthSearchResponse { hits, total_hits: raw.total_hits, offset: raw.offset, limit: raw.limit })
 }
 
 
-/// Search for players: only mods a moderator approved (and did not block), always client-only.
-async fn modrinth_search_approved(
-    query: Option<String>,
-    game_version: Option<String>,
-    loader: Option<String>,
-    categories: Option<Vec<String>>,
-    index: Option<String>,
-    offset: Option<u32>,
-    limit: Option<u32>,
-) -> Result<ModrinthSearchResponse, String> {
-    let (mc_version, config_loader) = pack_game_version(game_version)?;
-    let project_loader = loader.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or(config_loader);
-    let offset = offset.unwrap_or(0) as usize;
-    let limit = limit.unwrap_or(20).clamp(1, 50) as usize;
-    let moderation = refresh_moderation().await;
-    let ids: Vec<String> = moderation.approved.iter().filter(|id| !moderation.blocked.contains(id)).cloned().collect();
-    if ids.is_empty() {
-        return Ok(ModrinthSearchResponse { hits: vec![], total_hits: 0, offset: offset as u32, limit: limit as u32 });
-    }
-    let client = modrinth_client()?;
-    let mut projects: Vec<serde_json::Value> = Vec::new();
-    for chunk in ids.chunks(40) {
-        let ids_text = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
-        let batch: Vec<serde_json::Value> = client
-            .get(format!("{MODRINTH_API}/projects"))
-            .header("User-Agent", MODRINTH_UA)
-            .query(&[("ids", ids_text.as_str())])
-            .send().await
-            .map_err(|e| format!("Modrinth недоступен: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("Modrinth вернул ошибку: {e}"))?
-            .json().await
-            .map_err(|e| format!("Не удалось разобрать ответ Modrinth: {e}"))?;
-        projects.extend(batch);
-    }
-    let text = |p: &serde_json::Value, key: &str| -> String { p.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string() };
-    let list = |p: &serde_json::Value, key: &str| -> Vec<String> {
-        p.get(key).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
-    };
-    let query_lower = query.unwrap_or_default().trim().to_lowercase();
-    let wanted: Vec<String> = categories.unwrap_or_default().into_iter().map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()).collect();
-    let mut hits: Vec<ModrinthHit> = projects.iter()
-        .filter(|project| {
-            let p: &serde_json::Value = project;
-            let client_side = text(p, "client_side");
-            let server_side = text(p, "server_side");
-            let cats: Vec<String> = list(p, "categories").into_iter().chain(list(p, "additional_categories")).map(|c| c.to_lowercase()).collect();
-            matches!(client_side.as_str(), "required" | "optional")
-                && matches!(server_side.as_str(), "optional" | "unsupported")
-                && list(p, "game_versions").iter().any(|v| v == &mc_version)
-                && list(p, "loaders").iter().any(|l| l == &project_loader)
-                && (query_lower.is_empty() || ["title", "description", "slug"].iter().any(|k| text(p, k).to_lowercase().contains(&query_lower)))
-                && (wanted.is_empty() || wanted.iter().any(|w| cats.contains(w)))
-        })
-        .map(|project| {
-            let p: &serde_json::Value = project;
-            ModrinthHit {
-                project_id: text(p, "id"),
-                slug: text(p, "slug"),
-                title: text(p, "title"),
-                description: text(p, "description"),
-                author: String::new(),
-                icon_url: p.get("icon_url").and_then(|v| v.as_str()).map(String::from),
-                downloads: p.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
-                follows: p.get("followers").and_then(|v| v.as_u64()).unwrap_or(0),
-                categories: list(p, "categories"),
-                client_side: text(p, "client_side"),
-                server_side: text(p, "server_side"),
-                date_modified: p.get("updated").and_then(|v| v.as_str()).map(String::from),
-            }
-        })
-        .collect();
-    match index.as_deref() {
-        Some("newest") => hits.sort_by(|a, b| b.date_modified.cmp(&a.date_modified)),
-        _ => hits.sort_by(|a, b| b.downloads.cmp(&a.downloads)),
-    }
-    let total = hits.len();
-    let page: Vec<ModrinthHit> = hits.into_iter().skip(offset).take(limit).collect();
-    Ok(ModrinthSearchResponse { hits: page, total_hits: total as u32, offset: offset as u32, limit: limit as u32 })
+/// What a player may see: everything the moderator did not block.
+fn hide_blocked(hits: Vec<ModrinthHit>, blocked: &[String]) -> Vec<ModrinthHit> {
+    hits.into_iter().filter(|hit| !blocked.contains(&hit.project_id)).collect()
 }
 
 /// Newest version of a project that has files for the pack's Minecraft version and loader.
@@ -2539,15 +2460,9 @@ async fn modrinth_install_mod(
     let game_path = expand_windows_path(&game_dir);
 
     let mut state = load_modrinth_state();
-    // Players may only download what a moderator approved; blocked mods exist only for the moderator.
-    if !as_moderator.unwrap_or(false) {
-        let moderation = refresh_moderation().await;
-        if moderation.blocked.iter().any(|b| b == &project_id) {
-            return Err("Этот мод недоступен".into());
-        }
-        if !moderation.approved.iter().any(|a| a == &project_id) {
-            return Err("Этот мод ещё не одобрен модератором, скачать его пока нельзя".into());
-        }
+    // Blocked mods can be downloaded only by the moderator.
+    if !as_moderator.unwrap_or(false) && refresh_moderation().await.blocked.iter().any(|b| b == &project_id) {
+        return Err("Этот мод недоступен".into());
     }
 
     let client = modrinth_client()?;
@@ -2665,9 +2580,7 @@ async fn get_extra_mods_state() -> Result<ExtraModsState, String> {
     installed.sort();
     let mut blocked = moderation.blocked.clone();
     blocked.sort();
-    let mut approved = moderation.approved.clone();
-    approved.sort();
-    Ok(ExtraModsState { installed, blocked, approved, titles: moderation.titles.clone() })
+    Ok(ExtraModsState { installed, blocked, titles: moderation.titles.clone() })
 }
 
 /// Open a link in the system browser. Only http/https are allowed.
@@ -3142,5 +3055,17 @@ mod server_auth_tests {
 
         match previous_appdata { Some(v) => env::set_var("LOCALAPPDATA", v), None => env::remove_var("LOCALAPPDATA") }
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn players_never_see_blocked_mods() {
+        let hit = |id: &str| ModrinthHit {
+            project_id: id.into(), slug: id.into(), title: id.into(), description: String::new(), author: String::new(),
+            icon_url: None, downloads: 0, follows: 0, categories: vec![], client_side: "required".into(),
+            server_side: "unsupported".into(), date_modified: None,
+        };
+        let visible = hide_blocked(vec![hit("good"), hit("cheat"), hit("also-good")], &["cheat".to_string()]);
+        let ids: Vec<&str> = visible.iter().map(|h| h.project_id.as_str()).collect();
+        assert_eq!(ids, vec!["good", "also-good"]);
+        assert_eq!(hide_blocked(vec![hit("a")], &[]).len(), 1);
     }
 }

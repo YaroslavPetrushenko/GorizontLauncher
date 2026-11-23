@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   Search, Loader2, Download, Ban, Check, AlertCircle, RefreshCw,
-  Unlock, ChevronDown, Package, ArrowDownToLine, ShieldAlert, ShieldCheck,
+  Unlock, ChevronDown, Package, ArrowDownToLine, ShieldAlert,
 } from 'lucide-react';
 import type { Key, T } from '../i18n';
 import { isModerator } from '../config';
@@ -41,7 +41,6 @@ interface ModrinthSearchResponse {
 interface ExtraModsState {
   installed: string[];
   blocked: string[];
-  approved?: string[];
   titles?: Record<string, string>;
 }
 
@@ -103,7 +102,6 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
 
   const [installed, setInstalled] = useState<Set<string>>(new Set());
   const [blocked, setBlocked] = useState<Set<string>>(new Set());
-  const [approved, setApproved] = useState<Set<string>>(new Set());
   const [busyId, setBusyId] = useState<string | null>(null);
   const [modError, setModError] = useState<Record<string, string>>({});
   const [showBlocked, setShowBlocked] = useState(false);
@@ -114,7 +112,6 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
       const state = await invoke<ExtraModsState>('get_extra_mods_state');
       setInstalled(new Set(state.installed ?? []));
       setBlocked(new Set(state.blocked ?? []));
-      setApproved(new Set(state.approved ?? []));
       if (state.titles) setTitles(prev => ({ ...prev, ...state.titles }));
     } catch {
       // Older build without the command: behave as if nothing is installed or blocked.
@@ -137,7 +134,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         limit: PAGE_SIZE,
         asModerator: moderator,
       });
-      // Players get only approved mods from the backend; the moderator gets everything and sees the marks.
+      // Players never get blocked mods from the backend; the moderator gets everything and sees the marks.
       const fresh = response.hits ?? [];
       setHits(prev => (append ? [...prev, ...fresh] : fresh));
       setTotal(response.totalHits ?? 0);
@@ -203,35 +200,6 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         if (next) copy.add(projectId); else copy.delete(projectId);
         return copy;
       });
-      // Blocking also withdraws the approval on the server.
-      if (next) setApproved(prev => { const copy = new Set(prev); copy.delete(projectId); return copy; });
-    } catch (e) {
-      setModError(prev => ({ ...prev, [projectId]: String(e) }));
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  // Approved = other players may download the mod. Approving a blocked mod lifts the block.
-  const setApprovedState = async (projectId: string, next: boolean, title?: string) => {
-    if (!moderator) return;
-    setBusyId(projectId);
-    setModError(prev => ({ ...prev, [projectId]: '' }));
-    try {
-      const password = await askPassword();
-      if (!password) return;
-      try {
-        await invoke('moderate_mod', { nickname: username, password, action: next ? 'approve' : 'unapprove', key: projectId, title: title ?? titles[projectId] ?? '' });
-      } catch (e) {
-        forgetPassword();
-        throw e;
-      }
-      if (next && title) {
-        rememberTitle(projectId, title);
-        setTitles(prev => ({ ...prev, [projectId]: title }));
-      }
-      setApproved(prev => { const copy = new Set(prev); if (next) copy.add(projectId); else copy.delete(projectId); return copy; });
-      if (next) setBlocked(prev => { const copy = new Set(prev); copy.delete(projectId); return copy; });
     } catch (e) {
       setModError(prev => ({ ...prev, [projectId]: String(e) }));
     } finally {
@@ -335,7 +303,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         <div className="mr-empty">
           <Package size={46} />
           <p>{t('mrEmpty')}</p>
-          <small>{moderator ? t('mrEmptyHint') : t('mrNoApprovedHint')}</small>
+          <small>{t('mrEmptyHint')}</small>
         </div>
       )}
 
@@ -364,7 +332,6 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                     <span key={name} className="mr-tag">{name}</span>
                   ))}
                   {isInstalled && <span className="mr-badge installed"><Check size={11} /> {t('mrInstalled')}</span>}
-                  {moderator && approved.has(hit.projectId) && <span className="mr-badge approved"><ShieldCheck size={11} /> {t('mrApprovedBadge')}</span>}
                   {moderator && blocked.has(hit.projectId) && <span className="mr-badge blocked"><ShieldAlert size={11} /> {t('mrBlockedBadge')}</span>}
                 </div>
 
@@ -381,14 +348,6 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                     {isBusy ? <Loader2 size={14} className="spin" /> : isInstalled ? <Check size={14} /> : <Download size={14} />}
                     {isBusy ? t('mrInstalling') : isInstalled ? t('mrInstalled') : t('mrInstall')}
                   </button>
-                  {moderator && <button
-                    className="mr-btn"
-                    onClick={() => setApprovedState(hit.projectId, !approved.has(hit.projectId), hit.title)}
-                    disabled={isBusy}
-                    title={t('mrApproveHint')}
-                  >
-                    <ShieldCheck size={14} /> {approved.has(hit.projectId) ? t('mrUnapprove') : t('mrApprove')}
-                  </button>}
                   {moderator && <button
                     className="mr-btn danger"
                     onClick={() => setBlockedState(hit.projectId, !blocked.has(hit.projectId), hit.title)}
