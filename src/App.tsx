@@ -211,7 +211,7 @@ export default function App() {
               {busy ? <Loader2 size={21} className="spin" /> : <Play size={21} fill="currentColor" />}
               {busy ? t('loading') : t('play')}<span />
             </button>
-            {(progress || status) && <ProgressBar percent={progress?.percent ?? 0} label={status ?? t('ready')} />}
+            {(progress || status) && <ProgressBar percent={progress?.percent ?? 0} speed={progress?.speed} label={status ?? t('ready')} />}
             <div className="security-note"><ShieldCheck size={16} /> {t('authNote')}</div>
           </section>
         )}

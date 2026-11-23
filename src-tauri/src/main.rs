@@ -13,9 +13,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::{HashMap, HashSet}, env, fs, io::{self, Read, Write}, path::{Path, PathBuf}, process::{Command, Stdio}};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use zip::ZipArchive;
 
@@ -33,11 +33,15 @@ fn verify_modpack_signature(zip_bytes: &[u8], signature_b64: &str) -> Result<(),
         .map_err(|_| "Подпись сборки не совпадает: архив изменён или подписан не автором сборки".to_string())
 }
 
-/// Java 21 runtime for this system (Eclipse Temurin): a zip on Windows, a tar.gz on macOS and Linux.
+/// Java 21 for this system: Oracle JDK 21.0.12.1 for the player's own system and processor (Windows x64,
+/// macOS Intel / Apple silicon, Linux x64 / ARM). It is a zip on Windows and a tar.gz elsewhere, so it is unpacked
+/// next to the launcher without an installer or administrator rights. (Oracle has no Windows ARM build; Windows on
+/// ARM runs the x64 one.)
 fn java_download_url() -> String {
-    let os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "mac" } else { "linux" };
+    let os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" };
     let arch = if cfg!(target_arch = "aarch64") && !cfg!(windows) { "aarch64" } else { "x64" };
-    format!("https://api.adoptium.net/v3/binary/latest/21/ga/{os}/{arch}/jre/hotspot/normal/eclipse")
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+    format!("https://download.oracle.com/java/21/archive/jdk-21.0.12.1_{os}-{arch}_bin.{ext}")
 }
 
 /// Name of the Java program inside a runtime's `bin` folder.
@@ -859,7 +863,7 @@ fn compute_file_sha256(path: &Path) -> Result<String, String> {
 }
 
 
-#[derive(Clone, Serialize)] struct DownloadProgress { downloaded: u64, total: Option<u64>, percent: f32, stage: String }
+#[derive(Clone, Serialize)] struct DownloadProgress { downloaded: u64, total: Option<u64>, percent: f32, stage: String, /** bytes per second, 0 when unknown or when the numbers are not bytes */ speed: u64 }
 #[derive(Deserialize)] struct Release { tag_name: String, #[serde(default)] draft: bool, assets: Vec<Asset> }
 #[derive(Deserialize)] struct Asset { name: String, browser_download_url: String }
 #[derive(Clone, Serialize)] struct LauncherUpdate { version: String, url: String, size: u64 }
@@ -873,9 +877,33 @@ fn validate_manifest(manifest: &PackManifest, config: &LauncherConfig) -> Result
     Ok(())
 }
 
+/// Speed meter of the download in progress: (stage, time of the last sample, bytes at that time, smoothed bytes/s).
+static SPEED_METER: Mutex<Option<(String, Instant, u64, f64)>> = Mutex::new(None);
+
+/// Smoothed download speed in bytes per second. Progress that is counted in files, not bytes, has no speed.
+fn download_speed(stage: &str, downloaded: u64, total: Option<u64>) -> u64 {
+    if total.map(|t| t < 1_000_000).unwrap_or(false) { return 0; }
+    let mut meter = SPEED_METER.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match meter.as_mut() {
+        Some((name, at, bytes, speed)) if name == stage && downloaded >= *bytes => {
+            let seconds = now.duration_since(*at).as_secs_f64();
+            if seconds >= 0.5 {
+                let instant = (downloaded - *bytes) as f64 / seconds;
+                *speed = if *speed <= 0.0 { instant } else { *speed * 0.7 + instant * 0.3 };
+                *at = now;
+                *bytes = downloaded;
+            }
+            *speed as u64
+        }
+        _ => { *meter = Some((stage.to_string(), now, downloaded, 0.0)); 0 }
+    }
+}
+
 fn emit_progress(app: &AppHandle, stage: &str, downloaded: u64, total: Option<u64>) {
     let percent = total.map(|t| if t > 0 { downloaded as f32 / t as f32 * 100.0 } else { 0.0 }).unwrap_or(0.0);
-    let _ = app.emit("download-progress", DownloadProgress { downloaded, total, percent, stage: stage.to_string() });
+    let speed = download_speed(stage, downloaded, total);
+    let _ = app.emit("download-progress", DownloadProgress { downloaded, total, percent, stage: stage.to_string(), speed });
 }
 
 /// After a modpack update, move mod jars that are no longer part of the pack into `mods-old`
@@ -1027,8 +1055,9 @@ async fn download_launcher_update(app: AppHandle, url: String) -> Result<(), Str
 
 #[tauri::command]
 async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
-    // Outside Windows a Java found on the system is used only when it really is a 64-bit Java 21 or newer.
-    let usable = |path: &Path| cfg!(windows) || detect_java_info(path).map(|i| i.major_version >= 21 && i.is_64bit).unwrap_or(false);
+    // A Java found on the system is used only when it really is a 64-bit Java 21 or newer; otherwise the launcher
+    // downloads its own, so the player never has to install Java.
+    let usable = |path: &Path| detect_java_info(path).map(|i| i.major_version >= 21 && i.is_64bit).unwrap_or(false);
     if let Ok(java_home) = env::var("JAVA_HOME") {
         let candidate = PathBuf::from(java_home).join("bin").join(java_program_name());
         if candidate.exists() && usable(&candidate) { return Ok(candidate); }
