@@ -33,7 +33,50 @@ fn verify_modpack_signature(zip_bytes: &[u8], signature_b64: &str) -> Result<(),
         .map_err(|_| "Подпись сборки не совпадает: архив изменён или подписан не автором сборки".to_string())
 }
 
-const JAVA_DOWNLOAD_URL: &str = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
+/// Java 21 runtime for this system (Eclipse Temurin): a zip on Windows, a tar.gz on macOS and Linux.
+fn java_download_url() -> String {
+    let os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "mac" } else { "linux" };
+    let arch = if cfg!(target_arch = "aarch64") && !cfg!(windows) { "aarch64" } else { "x64" };
+    format!("https://api.adoptium.net/v3/binary/latest/21/ga/{os}/{arch}/jre/hotspot/normal/eclipse")
+}
+
+/// Name of the Java program inside a runtime's `bin` folder.
+fn java_program_name() -> &'static str { if cfg!(windows) { "javaw.exe" } else { "java" } }
+
+/// `bin/java` somewhere below `dir` (a JRE unpacked from an archive keeps it one to three folders deep).
+fn find_java_in(dir: &Path, depth: u32) -> Option<PathBuf> {
+    let candidate = dir.join("bin").join(java_program_name());
+    if candidate.is_file() { return Some(candidate); }
+    if depth == 0 { return None; }
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() { if let Some(found) = find_java_in(&path, depth - 1) { return Some(found); } }
+    }
+    None
+}
+
+fn extract_java_archive(archive_path: &Path, target: &Path) -> Result<(), String> {
+    let file = fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    if cfg!(windows) {
+        let mut archive = ZipArchive::new(file).map_err(|e| format!("Архив Java повреждён: {e}"))?;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            let name = entry.enclosed_name().ok_or_else(|| "Небезопасный путь в архиве Java".to_string())?.to_owned();
+            let out = target.join(name);
+            if entry.is_dir() { fs::create_dir_all(out).map_err(|e| e.to_string())?; }
+            else {
+                if let Some(parent) = out.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+                let mut output = fs::File::create(out).map_err(|e| e.to_string())?;
+                io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    } else {
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        archive.set_preserve_permissions(true);
+        archive.unpack(target).map_err(|e| format!("Архив Java повреждён: {e}"))
+    }
+}
 
 /// Account currently signed in inside the launcher.
 /// The Bukkit plugin asks the launcher over HTTP whether a joining player is
@@ -67,19 +110,54 @@ fn webhook_token() -> String {
     env::var("WEBHOOK_TOKEN").unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Platform helpers: the launcher runs on Windows, macOS and Linux.
+// ---------------------------------------------------------------------------------------------------------------------
+
+fn home_dir() -> PathBuf {
+    env::var("HOME").or_else(|_| env::var("USERPROFILE")).map(PathBuf::from).unwrap_or_default()
+}
+
+/// Where per-user application data lives (LOCALAPPDATA on Windows). An explicit LOCALAPPDATA always wins.
+fn local_data_root() -> PathBuf {
+    if let Ok(path) = env::var("LOCALAPPDATA") { if !path.is_empty() { return PathBuf::from(path); } }
+    if cfg!(target_os = "macos") { return home_dir().join("Library").join("Application Support"); }
+    match env::var("XDG_DATA_HOME") { Ok(path) if !path.is_empty() => PathBuf::from(path), _ => home_dir().join(".local").join("share") }
+}
+
+/// APPDATA on Windows; the same folder as the data root elsewhere.
+fn roaming_data_root() -> PathBuf {
+    if let Ok(path) = env::var("APPDATA") { if !path.is_empty() { return PathBuf::from(path); } }
+    local_data_root()
+}
+
+/// The folder of the official Minecraft launcher (only used to reuse libraries, assets and config).
+fn default_minecraft_dir() -> PathBuf {
+    if cfg!(windows) { roaming_data_root().join(".minecraft") }
+    else if cfg!(target_os = "macos") { roaming_data_root().join("minecraft") }
+    else { home_dir().join(".minecraft") }
+}
+
+/// Name of the operating system in Mojang's version profiles ("rules" -> "os" -> "name").
+fn current_os_rule_name() -> &'static str {
+    if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "osx" } else { "linux" }
+}
+
+/// A native-library classifier ("...:natives-windows-arm64") that is not for this system and processor.
+fn native_library_for_other_platform(name: &str) -> bool {
+    let classifier = name.rsplit(':').next().unwrap_or("");
+    let Some(rest) = classifier.strip_prefix("natives-") else { return false };
+    let os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" };
+    let wanted = if cfg!(target_arch = "aarch64") { format!("{os}-arm64") } else { os.to_string() };
+    rest.replace("osx", "macos") != wanted
+}
+
+/// Settings store paths like `%APPDATA%/.GorizontLauncher`: the variables are expanded on every system.
 fn expand_windows_path(input: &str) -> PathBuf {
     let mut value = input.to_string();
-    if value.contains("%APPDATA%") {
-        if let Ok(app_data) = env::var("APPDATA") {
-            value = value.replace("%APPDATA%", &app_data);
-        }
-    }
-    if value.contains("%LOCALAPPDATA%") {
-        if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
-            value = value.replace("%LOCALAPPDATA%", &local_app_data);
-        }
-    }
-    PathBuf::from(value.replace('/', "\\"))
+    if value.contains("%APPDATA%") { value = value.replace("%APPDATA%", &roaming_data_root().to_string_lossy()); }
+    if value.contains("%LOCALAPPDATA%") { value = value.replace("%LOCALAPPDATA%", &local_data_root().to_string_lossy()); }
+    if cfg!(windows) { PathBuf::from(value.replace('/', "\\")) } else { PathBuf::from(value.replace('\\', "/")) }
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
@@ -102,7 +180,7 @@ fn ensure_assets(target: &Path) -> Result<(), String> {
     let libs_dir = target.join("libraries");
     let libs_exist = libs_dir.exists() && libs_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
     if !libs_exist {
-        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_mc = default_minecraft_dir();
         let default_libs = default_mc.join("libraries");
         if default_libs.exists() {
             eprintln!("[ASSETS] Copying libraries from {}", default_libs.display());
@@ -114,7 +192,7 @@ fn ensure_assets(target: &Path) -> Result<(), String> {
     // Copy assets (indexes/objects) from default .minecraft if missing
     let assets_dir = target.join("assets");
     if !assets_dir.join("indexes").exists() {
-        let default_assets = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft").join("assets")).unwrap_or_default();
+        let default_assets = default_minecraft_dir().join("assets");
         if default_assets.exists() {
             eprintln!("[ASSETS] Copying assets from {}", default_assets.display());
             copy_dir_all(&default_assets, &assets_dir).map_err(|e| format!("Не удалось скопировать assets: {e}"))?;
@@ -126,7 +204,7 @@ fn ensure_assets(target: &Path) -> Result<(), String> {
     let config_dir = target.join("config");
     let config_exist = config_dir.exists() && config_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
     if !config_exist {
-        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
+        let default_mc = default_minecraft_dir();
         let default_config = default_mc.join("config");
         if default_config.exists() {
             eprintln!("[ASSETS] Copying config from {}", default_config.display());
@@ -139,8 +217,7 @@ fn ensure_assets(target: &Path) -> Result<(), String> {
 }
 
 fn launcher_data_dir() -> Result<PathBuf, String> {
-    let base = env::var("LOCALAPPDATA").map_err(|_| "Не удалось определить LOCALAPPDATA".to_string())?;
-    let path = PathBuf::from(base).join("GorizontLauncher"); fs::create_dir_all(&path).map_err(|e| e.to_string())?; Ok(path)
+    let path = local_data_root().join("GorizontLauncher"); fs::create_dir_all(&path).map_err(|e| e.to_string())?; Ok(path)
 }
 
 #[derive(Deserialize, Clone)]
@@ -676,8 +753,8 @@ fn profile_values(values: &[serde_json::Value], replacements: &[(&str, String)])
         if let Some(rules) = value.get("rules").and_then(|rules| rules.as_array()) {
             // Feature-gated arguments (--demo, custom resolution, quick play) must not be passed unconditionally.
             if rules.iter().any(|rule| rule.get("features").is_some()) { return Vec::new(); }
-            let allowed_for_windows = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name == "windows").unwrap_or(true));
-            let restricted_elsewhere = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name != "windows").unwrap_or(false));
+            let allowed_for_windows = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name == current_os_rule_name()).unwrap_or(true));
+            let restricted_elsewhere = rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|name| name.as_str()).map(|name| name != current_os_rule_name()).unwrap_or(false));
             if restricted_elsewhere && !allowed_for_windows { return Vec::new(); }
         }
         if let Some(text) = value.get("value").and_then(|v| v.as_str()) { return vec![text.to_string()]; }
@@ -885,17 +962,29 @@ async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: S
     emit_progress(&app, "Готово", 1, Some(1)); Ok(())
 }
 
+/// The installer of a launcher release that fits this system.
+fn update_asset_matches(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    let arm = cfg!(target_arch = "aarch64");
+    let arch_ok = |arm_names: &[&str], intel_names: &[&str]| if arm { arm_names.iter().any(|n| lower.contains(n)) } else { intel_names.iter().any(|n| lower.contains(n)) };
+    if cfg!(windows) { lower.ends_with("-setup.exe") }
+    else if cfg!(target_os = "macos") { lower.ends_with(".dmg") && arch_ok(&["aarch64", "arm64"], &["x64", "x86_64"]) }
+    else { lower.ends_with(".appimage") && arch_ok(&["aarch64", "arm64"], &["amd64", "x86_64"]) }
+}
+
 #[tauri::command]
 async fn check_launcher_update() -> Result<Option<LauncherUpdate>, String> {
     let config = launcher_config()?;
     let releases: Vec<serde_json::Value> = serde_json::from_str(&fetch_releases_text(&config).await?).map_err(|e| e.to_string())?;
     let current = env!("CARGO_PKG_VERSION");
-    for release in releases { let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default(); if !tag.starts_with("launcher-v") { continue; } let version = tag.trim_start_matches("launcher-v"); if !version_newer(version, current) { continue; } if let Some(asset) = release.get("assets").and_then(|v| v.as_array()).and_then(|assets| assets.iter().find(|a| a.get("name").and_then(|v| v.as_str()).map(|n| n.ends_with("-setup.exe")).unwrap_or(false))) { return Ok(Some(LauncherUpdate { version: version.into(), url: asset.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or_default().into(), size: asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0) })); } }
+    for release in releases { let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default(); if !tag.starts_with("launcher-v") { continue; } let version = tag.trim_start_matches("launcher-v"); if !version_newer(version, current) { continue; } if let Some(asset) = release.get("assets").and_then(|v| v.as_array()).and_then(|assets| assets.iter().find(|a| a.get("name").and_then(|v| v.as_str()).map(update_asset_matches).unwrap_or(false))) { return Ok(Some(LauncherUpdate { version: version.into(), url: asset.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or_default().into(), size: asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0) })); } }
     Ok(None)
 }
 
 #[tauri::command]
 async fn download_launcher_update(app: AppHandle, url: String) -> Result<(), String> {
+    // macOS and Linux: the new version is downloaded by the browser and installed by the player.
+    if !cfg!(windows) { return open_external_url(url); }
     let response = reqwest::Client::new().get(&url).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
     let total = response.content_length(); let mut downloaded = 0; let mut bytes = Vec::new(); let mut stream = response.bytes_stream(); emit_progress(&app, "Скачиваем обновление лаунчера...", 0, total);
     while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(&app, "Скачиваем обновление лаунчера...", downloaded, total); }
@@ -938,16 +1027,50 @@ async fn download_launcher_update(app: AppHandle, url: String) -> Result<(), Str
 
 #[tauri::command]
 async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
-    if let Ok(java_home) = env::var("JAVA_HOME") { let candidate = PathBuf::from(java_home).join("bin").join("javaw.exe"); if candidate.exists() { return Ok(candidate); } }
-    if let Ok(path) = env::var("PATH") { for folder in path.split(';') { let candidate = PathBuf::from(folder).join("javaw.exe"); if candidate.exists() { return Ok(candidate); } } }
-    let root = launcher_data_dir()?.join("runtime"); let java = root.join("bin").join("javaw.exe"); if java.exists() { return Ok(java); }
-    fs::create_dir_all(&root).map_err(|e| e.to_string())?; emit_progress(app, "Скачиваем Java 21...", 0, None);
-    let response = reqwest::Client::new().get(JAVA_DOWNLOAD_URL).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| format!("Не удалось скачать Java 21: {e}"))?; let total = response.content_length(); let mut bytes = Vec::new(); let mut downloaded = 0; let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(app, "Скачиваем Java 21...", downloaded, total); }
-    let archive_path = launcher_data_dir()?.join("java.zip"); fs::write(&archive_path, bytes).map_err(|e| e.to_string())?; emit_progress(app, "Распаковываем Java 21...", 0, None);
-    let file = fs::File::open(&archive_path).map_err(|e| e.to_string())?; let mut archive = ZipArchive::new(file).map_err(|e| format!("Архив Java повреждён: {e}"))?; let temp = launcher_data_dir()?.join("runtime-new"); if temp.exists() { fs::remove_dir_all(&temp).map_err(|e| e.to_string())?; } fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
-    for i in 0..archive.len() { let mut entry = archive.by_index(i).map_err(|e| e.to_string())?; let name = entry.enclosed_name().ok_or_else(|| "Небезопасный путь в архиве Java".to_string())?.to_owned(); let out = temp.join(name); if entry.is_dir() { fs::create_dir_all(out).map_err(|e| e.to_string())?; } else { if let Some(parent) = out.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; } let mut output = fs::File::create(out).map_err(|e| e.to_string())?; io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?; } }
-    let java_candidate = fs::read_dir(&temp).map_err(|e| e.to_string())?.filter_map(Result::ok).map(|e| e.path().join("bin").join("javaw.exe")).find(|p| p.exists()).ok_or_else(|| "В скачанном архиве Java не найден javaw.exe".to_string())?; if root.exists() { fs::remove_dir_all(&root).map_err(|e| e.to_string())?; } fs::rename(&temp, &root).map_err(|e| e.to_string())?; let _ = fs::remove_file(archive_path); Ok(root.join(java_candidate.strip_prefix(&temp).unwrap_or(Path::new("bin\\javaw.exe"))))
+    // Outside Windows a Java found on the system is used only when it really is a 64-bit Java 21 or newer.
+    let usable = |path: &Path| cfg!(windows) || detect_java_info(path).map(|i| i.major_version >= 21 && i.is_64bit).unwrap_or(false);
+    if let Ok(java_home) = env::var("JAVA_HOME") {
+        let candidate = PathBuf::from(java_home).join("bin").join(java_program_name());
+        if candidate.exists() && usable(&candidate) { return Ok(candidate); }
+    }
+    // macOS has a /usr/bin/java stub that opens an "install Java" dialog, so PATH is not searched there.
+    if !cfg!(target_os = "macos") {
+        if let Some(path) = env::var_os("PATH") {
+            for folder in env::split_paths(&path) {
+                let candidate = folder.join(java_program_name());
+                if candidate.exists() && usable(&candidate) { return Ok(candidate); }
+            }
+        }
+    }
+    let root = launcher_data_dir()?.join("runtime");
+    if let Some(java) = find_java_in(&root, 4) { return Ok(java); }
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    emit_progress(app, "Скачиваем Java 21...", 0, None);
+    let response = reqwest::Client::new().get(java_download_url()).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| format!("Не удалось скачать Java 21: {e}"))?
+        .error_for_status().map_err(|e| format!("Не удалось скачать Java 21: {e}"))?;
+    let total = response.content_length();
+    let mut bytes = Vec::new();
+    let mut downloaded = 0;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        bytes.extend_from_slice(&chunk);
+        emit_progress(app, "Скачиваем Java 21...", downloaded, total);
+    }
+    let archive_path = launcher_data_dir()?.join(if cfg!(windows) { "java.zip" } else { "java.tar.gz" });
+    fs::write(&archive_path, bytes).map_err(|e| e.to_string())?;
+    emit_progress(app, "Распаковываем Java 21...", 0, None);
+    let temp = launcher_data_dir()?.join("runtime-new");
+    if temp.exists() { fs::remove_dir_all(&temp).map_err(|e| e.to_string())?; }
+    fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
+    extract_java_archive(&archive_path, &temp)?;
+    let found = find_java_in(&temp, 4).ok_or_else(|| format!("В скачанном архиве Java не найден {}", java_program_name()))?;
+    let relative = found.strip_prefix(&temp).map(|p| p.to_path_buf()).map_err(|e| e.to_string())?;
+    if root.exists() { fs::remove_dir_all(&root).map_err(|e| e.to_string())?; }
+    fs::rename(&temp, &root).map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(archive_path);
+    Ok(root.join(relative))
 }
 
 /// Latest published modpack version on GitHub (None when offline or no release has the pack asset).
@@ -1239,9 +1362,9 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
 }
 
 fn library_allowed(library: &serde_json::Value) -> bool {
-    if let Some(name) = library.get("name").and_then(|n| n.as_str()) { if name.ends_with("natives-windows-arm64") || name.ends_with("natives-windows-x86") { return false; } }
+    if let Some(name) = library.get("name").and_then(|n| n.as_str()) { if native_library_for_other_platform(name) { return false; } }
     match library.get("rules").and_then(|r| r.as_array()) {
-        Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
+        Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == current_os_rule_name()).unwrap_or(true)),
         None => true,
     }
 }
@@ -1426,6 +1549,7 @@ async fn ensure_loader(app: &AppHandle, game_path: &Path, info: &LoaderInfo) -> 
 #[serde(rename_all = "camelCase")]
 struct SystemMemory { total_mb: u64, available_mb: u64 }
 
+#[allow(dead_code)]
 #[repr(C)]
 struct MemoryStatusEx { length: u32, memory_load: u32, total_phys: u64, avail_phys: u64, total_page_file: u64, avail_page_file: u64, total_virtual: u64, avail_virtual: u64, avail_extended_virtual: u64 }
 
@@ -1433,11 +1557,30 @@ struct MemoryStatusEx { length: u32, memory_load: u32, total_phys: u64, avail_ph
 #[link(name = "kernel32")]
 extern "system" { fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32; }
 
+#[allow(unreachable_code)]
 fn read_system_memory() -> Option<SystemMemory> {
     #[cfg(windows)]
     {
         let mut status = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, memory_load: 0, total_phys: 0, avail_phys: 0, total_page_file: 0, avail_page_file: 0, total_virtual: 0, avail_virtual: 0, avail_extended_virtual: 0 };
         if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { return Some(SystemMemory { total_mb: status.total_phys / 1024 / 1024, available_mb: status.avail_phys / 1024 / 1024 }); }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = fs::read_to_string("/proc/meminfo").ok()?;
+        let kb = |key: &str| text.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok());
+        let total = kb("MemTotal:")?;
+        return Some(SystemMemory { total_mb: total / 1024, available_mb: kb("MemAvailable:").unwrap_or(total / 2) / 1024 });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = |program: &str, args: &[&str]| Command::new(program).args(args).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        let total: u64 = output("sysctl", &["-n", "hw.memsize"])?.trim().parse().ok()?;
+        // vm_stat counts pages: free + inactive + speculative are available to programs.
+        let vm = output("vm_stat", &[]).unwrap_or_default();
+        let page: u64 = vm.lines().next().and_then(|l| l.split("page size of ").nth(1)).and_then(|l| l.split_whitespace().next()).and_then(|v| v.parse().ok()).unwrap_or(4096);
+        let pages = |key: &str| vm.lines().find(|l| l.starts_with(key)).and_then(|l| l.split(':').nth(1)).and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok()).unwrap_or(0);
+        let available = (pages("Pages free") + pages("Pages inactive") + pages("Pages speculative")) * page;
+        return Some(SystemMemory { total_mb: total / 1024 / 1024, available_mb: if available == 0 { total / 2 / 1024 / 1024 } else { available / 1024 / 1024 } });
     }
     None
 }
@@ -1531,6 +1674,8 @@ fn filter_jvm_args(args: &[String], java_info: &JavaInfo, _required_java: u32) -
 /// Escape a Windows command argument: quote if it contains spaces or double-quotes.
 /// Backslashes in Windows paths are normal and do NOT need quoting.
 fn escape_windows_arg(arg: &str) -> String {
+    // Arguments are passed to the program directly (no shell), so only Windows' own quoting needs this.
+    if !cfg!(windows) { return arg.to_string(); }
     if arg.is_empty() {
         return "".to_string();
     }
@@ -1641,9 +1786,9 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let profile: VersionProfile = serde_json::from_str(&profile_text).map_err(|e| format!("Профиль Minecraft повреждён: {e}"))?;
     let libraries = profile.libraries.unwrap_or_default().into_iter().filter(|library| {
         // Skip libraries restricted to other operating systems/architectures.
-        if let Some(name) = &library.name { if name.ends_with("natives-windows-arm64") || name.ends_with("natives-windows-x86") { return false; } }
+        if let Some(name) = &library.name { if native_library_for_other_platform(name) { return false; } }
         match &library.rules {
-            Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == "windows").unwrap_or(true)),
+            Some(rules) => rules.iter().any(|rule| rule.get("action").and_then(|a| a.as_str()) == Some("allow") && rule.get("os").and_then(|os| os.get("name")).and_then(|n| n.as_str()).map(|n| n == current_os_rule_name()).unwrap_or(true)),
             None => true,
         }
     }).filter_map(|library| library.artifact.or(library.downloads.and_then(|d| d.artifact)).map(|a| {
@@ -1654,10 +1799,11 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let assets_index = profile.assets.clone().unwrap_or_else(|| config.minecraft_version.clone());
     // Escape each classpath entry for paths with spaces/Cyrillic, then join with ;
     let cp_entries: Vec<String> = libraries.into_iter().chain(std::iter::once(jar.to_string_lossy().to_string())).map(|p| escape_windows_arg(&p)).collect();
-    let classpath = cp_entries.join(";");
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let classpath = cp_entries.join(separator);
     let access_token_value = access_token.unwrap_or_else(|| "0".to_string());
     let uuid_value = "00000000000000000000000000000000".to_string();
-    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", assets_index.clone()), ("${auth_access_token}", access_token_value), ("${auth_uuid}", uuid_value), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", escape_windows_arg(&game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())), ("${library_directory}", escape_windows_arg(&game_path.join("libraries").to_string_lossy().to_string())), ("${classpath_separator}", ";".into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
+    let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", assets_index.clone()), ("${auth_access_token}", access_token_value), ("${auth_uuid}", uuid_value), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", escape_windows_arg(&game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())), ("${library_directory}", escape_windows_arg(&game_path.join("libraries").to_string_lossy().to_string())), ("${classpath_separator}", separator.into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
     let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
     let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{}M", ram.min(2048))];
     if let Some(jvm) = jvm {
@@ -2767,7 +2913,8 @@ fn open_external_url(url: String) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Command::new("xdg-open").arg(target).spawn().map_err(|e| format!("Не удалось открыть ссылку: {e}"))?;
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(opener).arg(target).spawn().map_err(|e| format!("Не удалось открыть ссылку: {e}"))?;
         Ok(())
     }
 }
