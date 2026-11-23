@@ -43,6 +43,7 @@ interface ExtraModsState {
   installed: string[];
   blocked: string[];
   titles?: Record<string, string>;
+  pack?: string[];
 }
 
 type SortIndex = 'relevance' | 'downloads' | 'newest';
@@ -102,6 +103,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
   const [error, setError] = useState('');
 
   const [installed, setInstalled] = useState<Set<string>>(new Set());
+  const [pack, setPack] = useState<Set<string>>(new Set());
   const [blocked, setBlocked] = useState<Set<string>>(new Set());
   const [busyId, setBusyId] = useState<string | null>(null);
   const [modError, setModError] = useState<Record<string, string>>({});
@@ -111,14 +113,15 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
 
   const loadState = useCallback(async () => {
     try {
-      const state = await invoke<ExtraModsState>('get_extra_mods_state');
+      const state = await invoke<ExtraModsState>('get_extra_mods_state', { gameDir });
       setInstalled(new Set(state.installed ?? []));
       setBlocked(new Set(state.blocked ?? []));
+      setPack(new Set(state.pack ?? []));
       if (state.titles) setTitles(prev => ({ ...prev, ...state.titles }));
     } catch {
       // Older build without the command: behave as if nothing is installed or blocked.
     }
-  }, []);
+  }, [gameDir]);
 
   useEffect(() => { loadState(); }, [loadState]);
 
@@ -287,8 +290,9 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
           {hits.map(hit => {
             const isBusy = busyId === hit.projectId;
             const isInstalled = installed.has(hit.projectId);
+            const inPack = pack.has(hit.projectId);
             return (
-              <article key={hit.projectId} className={`mr-card ${isInstalled ? 'installed' : ''}`}>
+              <article key={hit.projectId} className={`mr-card ${isInstalled || inPack ? 'installed' : ''}`}>
                 <div className="mr-card-top">
                   {hit.iconUrl
                     ? <img className="mr-icon" src={hit.iconUrl} alt="" loading="lazy" />
@@ -306,6 +310,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                   {hit.categories.slice(0, 3).map(name => (
                     <span key={name} className="mr-tag">{name}</span>
                   ))}
+                  {inPack && <span className="mr-badge installed"><Check size={11} /> {t('mrInPack')}</span>}
                   {isInstalled && <span className="mr-badge installed"><Check size={11} /> {t('mrInstalled')}</span>}
                   {moderator && blocked.has(hit.projectId) && <span className="mr-badge blocked"><ShieldAlert size={11} /> {t('mrBlockedBadge')}</span>}
                 </div>
@@ -318,10 +323,11 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                   <button
                     className="mr-btn primary"
                     onClick={() => install(hit)}
-                    disabled={isBusy}
+                    disabled={isBusy || inPack}
+                    title={inPack ? t('mrInPackHint') : undefined}
                   >
-                    {isBusy ? <Loader2 size={14} className="spin" /> : isInstalled ? <Repeat size={14} /> : <Download size={14} />}
-                    {isInstalled ? t('userModsChange') : t('mrInstall')}
+                    {isBusy ? <Loader2 size={14} className="spin" /> : inPack ? <Check size={14} /> : isInstalled ? <Repeat size={14} /> : <Download size={14} />}
+                    {inPack ? t('mrInPack') : isInstalled ? t('userModsChange') : t('mrInstall')}
                   </button>
                   {moderator && <button
                     className="mr-btn danger"

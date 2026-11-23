@@ -2317,6 +2317,8 @@ struct ExtraModsState {
     installed: Vec<String>,
     blocked: Vec<String>,
     titles: HashMap<String, String>,
+    /// Modrinth projects that are already part of the modpack: they are shown as such and cannot be downloaded.
+    pack: Vec<String>,
 }
 
 /// What is remembered about an installed mod, from the Modrinth project description.
@@ -2589,6 +2591,9 @@ async fn modrinth_install_mod(
         return Err("Этот мод недоступен".into());
     }
 
+    if pack_project_ids(&game_path).await.contains(&project_id) {
+        return Err("Этот мод уже входит в сборку, скачивать его не нужно".into());
+    }
     let client = modrinth_client()?;
     // Whatever the search showed, only client mods may be installed (checked against Modrinth itself).
     let project: serde_json::Value = client
@@ -2733,14 +2738,19 @@ async fn modrinth_install_mod(
 
 /// Installed and blocked Modrinth project ids.
 #[tauri::command]
-async fn get_extra_mods_state() -> Result<ExtraModsState, String> {
+async fn get_extra_mods_state(game_dir: Option<String>) -> Result<ExtraModsState, String> {
     let state = load_modrinth_state();
     let moderation = refresh_moderation().await;
     let mut installed: Vec<String> = state.installed.keys().cloned().collect();
     installed.sort();
     let mut blocked = moderation.blocked.clone();
     blocked.sort();
-    Ok(ExtraModsState { installed, blocked, titles: moderation.titles.clone() })
+    let mut pack: Vec<String> = match game_dir {
+        Some(dir) => pack_project_ids(&expand_windows_path(&dir)).await.into_iter().collect(),
+        None => Vec::new(),
+    };
+    pack.sort();
+    Ok(ExtraModsState { installed, blocked, titles: moderation.titles.clone(), pack })
 }
 
 /// Open a link in the system browser. Only http/https are allowed.
@@ -2950,6 +2960,40 @@ async fn refresh_moderation() -> ModerationState {
             load_moderation_cache().unwrap_or_default()
         }
     }
+}
+
+/// Modrinth projects the modpack's own mods belong to (file name -> project id, empty when unknown), recognised by
+/// the hash of each jar and remembered on disk, so Modrinth is asked only about jars it has not seen yet.
+async fn pack_project_ids(game_path: &Path) -> HashSet<String> {
+    let cache_path = launcher_data_dir().ok().map(|d| d.join("pack-projects.json"));
+    let mut cache: HashMap<String, String> = cache_path.as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let names = pack_mod_filenames(game_path);
+    let mods_dir = game_path.join("mods");
+    let mut by_hash: HashMap<String, String> = HashMap::new();
+    for name in names.iter().filter(|n| n.to_lowercase().ends_with(".jar") && !cache.contains_key(*n)) {
+        if let Ok(hash) = compute_file_sha512(&mods_dir.join(name)) { by_hash.insert(hash, name.clone()); }
+    }
+    if !by_hash.is_empty() {
+        if let Ok(client) = modrinth_client() {
+            let hashes: Vec<&String> = by_hash.keys().collect();
+            let reply = client.post(format!("{MODRINTH_API}/version_files")).header("User-Agent", MODRINTH_UA)
+                .json(&serde_json::json!({ "hashes": hashes, "algorithm": "sha512" })).send().await;
+            if let Ok(r) = reply {
+                if r.status().is_success() {
+                    if let Ok(found) = r.json::<HashMap<String, ModrinthVersion>>().await {
+                        for (hash, name) in &by_hash {
+                            cache.insert(name.clone(), found.get(hash).map(|v| v.project_id.clone()).unwrap_or_default());
+                        }
+                        if let (Some(path), Ok(text)) = (cache_path.as_ref(), serde_json::to_string(&cache)) { let _ = fs::write(path, text); }
+                    }
+                }
+            }
+        }
+    }
+    names.iter().filter_map(|n| cache.get(n)).filter(|id| !id.is_empty()).cloned().collect()
 }
 
 /// Set when Modrinth could not be asked about hand-placed jars: nothing is then removed as "unknown",
