@@ -1754,7 +1754,8 @@ async fn auth_login(
                 "invalid_password" => return Err("Неверный пароль".into()),
                 "not_found" => return Err("Пользователь не найден".into()),
                 "invalid_input" => return Err("Некорректный ник или пароль".into()),
-                other => return Err(format!("Сервер авторизации: {other}")),
+                "locked" => return Err(reply.error.clone().unwrap_or_else(|| "Слишком много неудачных попыток, попробуйте позже".into())),
+                other => return Err(reply.error.clone().unwrap_or_else(|| format!("Сервер авторизации: {other}"))),
             },
             Err(e) => eprintln!("[AUTH] Server login unavailable, using local account: {e}"),
         }
@@ -2570,7 +2571,7 @@ fn server_api_base() -> Result<String, String> {
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 struct ServerAuthReply {
-    /// registered | already_exists | ok | invalid_password | not_found | invalid_input | error
+    /// registered | already_exists | ok | invalid_password | not_found | invalid_input | locked | error
     status: String,
     #[serde(default)]
     error: Option<String>,
