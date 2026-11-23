@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "gorizont-launcher"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
   "argon2",
   "axum",
