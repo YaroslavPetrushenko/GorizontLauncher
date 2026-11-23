@@ -387,6 +387,88 @@ fn modpack_file_set(game_path: &Path) -> HashSet<String> {
     files
 }
 
+fn pack_mods_list_path(game_path: &Path) -> PathBuf {
+    game_path.join(".gorizont-pack-mods.json")
+}
+
+fn save_pack_mod_list(game_path: &Path, names: &HashSet<String>) {
+    let mut sorted: Vec<&String> = names.iter().collect();
+    sorted.sort();
+    if let Ok(text) = serde_json::to_string_pretty(&sorted) { let _ = fs::write(pack_mods_list_path(game_path), text); }
+}
+
+/// File names of the mods that belong to the modpack. They are not "user mods": no approval applies to them and
+/// the launcher does not list them.
+fn pack_mod_filenames(game_path: &Path) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Ok(text) = fs::read_to_string(pack_mods_list_path(game_path)) {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&text) { names.extend(list); }
+    }
+    for path in modpack_file_set(game_path) {
+        if let Some(name) = path.strip_prefix("mods/") { names.insert(name.to_string()); }
+    }
+    names
+}
+
+/// File names inside a zip on a web server, read from its central directory with one HTTP Range request
+/// (the pack is hundreds of megabytes, only the last bytes are needed).
+async fn remote_zip_names(url: &str) -> Result<Vec<String>, String> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
+    // Some download servers answer 501 to suffix ranges ("bytes=-N"), so ask for the size first.
+    let probe = client.get(url).header("User-Agent", "GorizontLauncher/1.0").header("Range", "bytes=0-0").send().await
+        .map_err(|e| format!("запрос: {e}"))?;
+    if probe.status().as_u16() != 206 { return Err(format!("сервер не поддерживает частичное чтение ({})", probe.status())); }
+    let total: u64 = probe.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit('/').next()).and_then(|v| v.parse().ok()).ok_or("сервер не сообщил размер архива")?;
+    let start = total.saturating_sub(262_144);
+    let response = client.get(url).header("User-Agent", "GorizontLauncher/1.0").header("Range", format!("bytes={start}-{}", total - 1)).send().await
+        .map_err(|e| format!("запрос: {e}"))?;
+    if response.status().as_u16() != 206 { return Err(format!("сервер не поддерживает частичное чтение ({})", response.status())); }
+    let tail = response.bytes().await.map_err(|e| e.to_string())?;
+    let eocd = tail.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).ok_or("нет записи конца архива")?;
+    if tail.len() < eocd + 22 { return Err("повреждённая запись конца архива".into()); }
+    let cd_size = u32::from_le_bytes([tail[eocd + 12], tail[eocd + 13], tail[eocd + 14], tail[eocd + 15]]) as usize;
+    if cd_size == 0 || cd_size > eocd { return Err("оглавление архива не поместилось в прочитанную часть".into()); }
+    let directory = &tail[eocd - cd_size..eocd];
+    let mut names = Vec::new();
+    let mut i = 0usize;
+    while i + 46 <= directory.len() && directory[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] {
+        let name_len = u16::from_le_bytes([directory[i + 28], directory[i + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([directory[i + 30], directory[i + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([directory[i + 32], directory[i + 33]]) as usize;
+        if i + 46 + name_len > directory.len() { break; }
+        names.push(String::from_utf8_lossy(&directory[i + 46..i + 46 + name_len]).replace('\\', "/"));
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    Ok(names)
+}
+
+/// Installs written before the pack list existed have no `.gorizont-pack-mods.json`: read the file list of the
+/// installed pack release once from GitHub so its mods are not mistaken for user mods.
+async fn ensure_pack_mods_list(game_path: &Path) {
+    if pack_mods_list_path(game_path).exists() { return; }
+    let Ok(text) = fs::read_to_string(game_path.join(".gorizont-installed.json")) else { return };
+    let Ok(installed) = serde_json::from_str::<PackManifest>(&text) else { return };
+    let Ok(config) = launcher_config() else { return };
+    let Ok(releases_text) = fetch_releases_text(&config).await else { return };
+    let Ok(releases) = serde_json::from_str::<Vec<Release>>(&releases_text) else { return };
+    let wanted = installed.pack_version.trim_start_matches('v').to_string();
+    let release = releases.iter().filter(|r| !r.draft)
+        .find(|r| r.tag_name.trim_start_matches('v').trim_start_matches("pack-") == wanted && r.assets.iter().any(|a| a.name == config.modpack_asset));
+    let Some(release) = release else { return };
+    let Some(asset) = release.assets.iter().find(|a| a.name == config.modpack_asset) else { return };
+    match remote_zip_names(&asset.browser_download_url).await {
+        Ok(names) => {
+            let mods: HashSet<String> = names.iter()
+                .filter_map(|n| n.strip_prefix("mods/").map(|m| m.to_string()))
+                .filter(|m| !m.is_empty() && !m.contains('/'))
+                .collect();
+            if !mods.is_empty() { save_pack_mod_list(game_path, &mods); }
+        }
+        Err(e) => eprintln!("[MODS] could not read the pack file list: {e}"),
+    }
+}
+
 /// Names of approved user mods (they must survive modpack updates).
 fn approved_user_mod_filenames(game_path: &Path) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -422,8 +504,14 @@ fn save_user_mods_manifest(game_path: &Path, manifest: &UserModsManifest) -> Res
 
 /// Scan the mods directory for user-installed mods and update the manifest
 fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
+    enforce_blocked_mods(game_path);
     let mods_dir = game_path.join("mods");
     let mut manifest = load_user_mods_manifest(game_path)?;
+    // Approval is decided by a moderator on the server. Without a cached list (never reached the server) the
+    // previous local flag is kept so that nothing disappears just because the server is offline.
+    let moderation = load_moderation_cache();
+    let catalog_files: HashSet<String> = load_modrinth_state().installed.values().map(|i| i.filename.clone()).collect();
+    let pack_mods = pack_mod_filenames(game_path);
     
     if !mods_dir.exists() {
         return Ok(manifest);
@@ -435,14 +523,13 @@ fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
         let path = entry.path();
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jar") {
             let filename = entry.file_name().to_string_lossy().to_string();
+            if pack_mods.contains(&filename) { continue; }
             // Use filename without .jar as ID
             let id = filename.strip_suffix(".jar").unwrap_or(&filename).to_string();
             
             // Compute hash if not already in manifest or if file changed
-            let should_update_hash = match manifest.mods.get(&id) {
-                Some(existing) => existing.hash.is_empty(),
-                None => true,
-            };
+            // Always re-hash: a jar swapped under an approved name must not inherit the approval.
+            let should_update_hash = true;
             
             let hash = if should_update_hash {
                 compute_file_sha256(&path)?
@@ -456,6 +543,10 @@ fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
             } else {
                 (true, false, None, None)
             };
+            let approved = match &moderation {
+                Some(list) => list.approved.iter().any(|h| h.eq_ignore_ascii_case(&hash)),
+                None => approved,
+            } || catalog_files.contains(&filename);
             
             manifest.mods.insert(id.clone(), UserMod {
                 id,
@@ -477,7 +568,7 @@ fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
         .map(|e| e.file_name().to_string_lossy().strip_suffix(".jar").unwrap_or("").to_string())
         .collect();
     
-    manifest.mods.retain(|id, _| existing_ids.contains(id));
+    manifest.mods.retain(|id, m| existing_ids.contains(id) && !pack_mods.contains(&m.filename));
     
     save_user_mods_manifest(game_path, &manifest)?;
     Ok(manifest)
@@ -753,6 +844,7 @@ fn retire_stale_mods<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target
         }
     }
     if keep.is_empty() { return; }
+    save_pack_mod_list(target, &keep);
     let approved = approved_user_mod_filenames(target);
     let mods_dir = target.join("mods");
     let old_dir = target.join("mods-old");
@@ -1559,6 +1651,8 @@ async fn prepare_game_files(app: AppHandle, game_dir: String, version_override: 
     let override_opt: Option<VersionOverride> = version_override.as_deref().and_then(|s| serde_json::from_str(s).ok());
     let effective_config = resolve_effective_config(&config, &override_opt);
     let game_path = expand_windows_path(&game_dir);
+    let _ = refresh_moderation().await;
+    enforce_blocked_mods(&game_path);
     let loader = read_installed_loader(&game_path, &effective_config);
     let version_id = loader_version_id(&loader);
     if let Err(e) = ensure_assets(&game_path) { eprintln!("[PREPARE] ensure_assets failed: {e}"); }
@@ -1852,6 +1946,8 @@ async fn auth_oauth(
 #[tauri::command]
 async fn scan_user_mods_cmd(game_dir: String) -> Result<UserModsManifest, String> {
     let game_path = expand_windows_path(&game_dir);
+    ensure_pack_mods_list(&game_path).await;
+    let _ = refresh_moderation().await;
     scan_user_mods(&game_path)
 }
 
@@ -1859,7 +1955,11 @@ async fn scan_user_mods_cmd(game_dir: String) -> Result<UserModsManifest, String
 #[tauri::command]
 async fn get_user_mods(game_dir: String) -> Result<UserModsManifest, String> {
     let game_path = expand_windows_path(&game_dir);
-    load_user_mods_manifest(&game_path)
+    ensure_pack_mods_list(&game_path).await;
+    let mut manifest = load_user_mods_manifest(&game_path)?;
+    let pack_mods = pack_mod_filenames(&game_path);
+    manifest.mods.retain(|_, m| !pack_mods.contains(&m.filename));
+    Ok(manifest)
 }
 
 /// Toggle user mod enabled/disabled state
@@ -1881,16 +1981,16 @@ async fn toggle_user_mod(game_dir: String, mod_id: String, enabled: bool) -> Res
 /// Toggle user mod approved state (for persistence across updates)
 #[tauri::command]
 async fn approve_user_mod(game_dir: String, mod_id: String, approved: bool) -> Result<UserModsManifest, String> {
+    // Approval belongs to the moderator and is stored on the server (see moderate_mod); a local request
+    // cannot grant it. This only re-reads the files and the server-wide list.
+    let _ = approved;
+    let _ = refresh_moderation().await;
     let game_path = expand_windows_path(&game_dir);
-    let mut manifest = load_user_mods_manifest(&game_path)?;
-    
-    if let Some(mod_entry) = manifest.mods.get_mut(&mod_id) {
-        mod_entry.approved = approved;
-        save_user_mods_manifest(&game_path, &manifest)?;
-    } else {
+    ensure_pack_mods_list(&game_path).await;
+    let manifest = scan_user_mods(&game_path)?;
+    if !manifest.mods.contains_key(&mod_id) {
         return Err(format!("Mod not found: {}", mod_id));
     }
-    
     Ok(manifest)
 }
 
@@ -2205,6 +2305,7 @@ struct InstalledProject {
 struct ExtraModsState {
     installed: Vec<String>,
     blocked: Vec<String>,
+    titles: HashMap<String, String>,
 }
 
 fn modrinth_state_path() -> Result<PathBuf, String> {
@@ -2237,10 +2338,14 @@ fn modrinth_facets(game_version: &str, loader: &str, categories: &[String]) -> s
         vec!["project_type:mod".to_string()],
         vec![format!("versions:{game_version}")],
         vec![format!("categories:{loader}")],
+        // Client mods only: they must work on the client and must not need to be on the server.
         vec![
             "client_side:required".to_string(),
             "client_side:optional".to_string(),
-            "client_side:unknown".to_string(),
+        ],
+        vec![
+            "server_side:unsupported".to_string(),
+            "server_side:optional".to_string(),
         ],
     ];
     let cats: Vec<String> = categories.iter()
@@ -2382,11 +2487,26 @@ async fn modrinth_install_mod(
     let game_path = expand_windows_path(&game_dir);
 
     let mut state = load_modrinth_state();
-    if state.blocked.iter().any(|b| b == &project_id) {
-        return Err("Этот мод заблокирован пользователем и не может быть установлен".into());
+    if refresh_moderation().await.blocked.iter().any(|b| b == &project_id) {
+        return Err("Этот мод заблокирован модератором и не может быть установлен".into());
     }
 
     let client = modrinth_client()?;
+    // Whatever the search showed, only client mods may be installed (checked against Modrinth itself).
+    let project: serde_json::Value = client
+        .get(format!("{MODRINTH_API}/project/{project_id}"))
+        .header("User-Agent", MODRINTH_UA)
+        .send().await
+        .map_err(|e| format!("Не удалось получить сведения о моде: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Сведения о моде недоступны: {e}"))?
+        .json().await
+        .map_err(|e| format!("Не удалось разобрать сведения о моде: {e}"))?;
+    let client_side = project.get("client_side").and_then(|v| v.as_str()).unwrap_or("");
+    let server_side = project.get("server_side").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(client_side, "required" | "optional") || !matches!(server_side, "optional" | "unsupported") {
+        return Err("Можно скачивать только клиентские моды: этот мод нужен ещё и на сервере или не работает на клиенте".into());
+    }
     let version = modrinth_pick_version(&client, &mc_version, &project_loader, &project_id).await?;
     let file = version.files.iter()
         .find(|f| f.primary && f.filename.to_lowercase().ends_with(".jar"))
@@ -2481,22 +2601,12 @@ async fn modrinth_install_mod(
 #[tauri::command]
 async fn get_extra_mods_state() -> Result<ExtraModsState, String> {
     let state = load_modrinth_state();
+    let moderation = refresh_moderation().await;
     let mut installed: Vec<String> = state.installed.keys().cloned().collect();
     installed.sort();
-    let mut blocked = state.blocked.clone();
+    let mut blocked = moderation.blocked.clone();
     blocked.sort();
-    Ok(ExtraModsState { installed, blocked })
-}
-
-/// Block or unblock a Modrinth project. Stored in the launcher user-data folder,
-/// so the list survives modpack updates and reinstalls.
-#[tauri::command]
-async fn set_mod_blocked(project_id: String, blocked: bool) -> Result<(), String> {
-    if project_id.trim().is_empty() { return Err("Не указан идентификатор мода".into()); }
-    let mut state = load_modrinth_state();
-    state.blocked.retain(|id| id != &project_id);
-    if blocked { state.blocked.push(project_id); }
-    save_modrinth_state(&state)
+    Ok(ExtraModsState { installed, blocked, titles: moderation.titles.clone() })
 }
 
 /// Open a link in the system browser. Only http/https are allowed.
@@ -2586,7 +2696,8 @@ fn signed_headers(secret: &str, body: &str) -> (String, String) {
     (format!("t={timestamp},n={nonce},v1={signature}"), nonce)
 }
 
-async fn server_api_call(path: &str, body: Option<String>) -> Result<ServerAuthReply, String> {
+/// Signed request to the plugin API; returns the raw response text.
+async fn server_api_raw(path: &str, body: Option<String>) -> Result<String, String> {
     let secret = server_hmac_secret().ok_or_else(|| {
         "Не задан GORIZONT_HMAC_SECRET — вход через сервер недоступен. Задайте тот же ключ, что в auth.hmacSecret плагина.".to_string()
     })?;
@@ -2612,6 +2723,11 @@ async fn server_api_call(path: &str, body: Option<String>) -> Result<ServerAuthR
     if !status_code.is_success() {
         return Err(format!("Сервер авторизации вернул HTTP {status_code}: {text}"));
     }
+    Ok(text)
+}
+
+async fn server_api_call(path: &str, body: Option<String>) -> Result<ServerAuthReply, String> {
+    let text = server_api_raw(path, body).await?;
     serde_json::from_str::<ServerAuthReply>(&text).map_err(|e| format!("Некорректный ответ сервера: {e}"))
 }
 
@@ -2649,6 +2765,95 @@ async fn server_auth_check_player(nickname: String) -> Result<serde_json::Value,
         .map_err(|e| format!("Сервер авторизации недоступен: {e}"))?;
     let text = response.text().await.map_err(|e| e.to_string())?;
     serde_json::from_str(&text).map_err(|e| format!("Некорректный ответ сервера: {e}"))
+}
+
+/// Server-wide mod moderation: Modrinth projects hidden from everyone and mod files approved to stay.
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ModerationState {
+    /// Modrinth project ids blocked by a moderator.
+    #[serde(default)]
+    blocked: Vec<String>,
+    /// SHA-256 of mod files approved by a moderator.
+    #[serde(default)]
+    approved: Vec<String>,
+    /// Human readable names for the keys above.
+    #[serde(default)]
+    titles: HashMap<String, String>,
+}
+
+fn moderation_cache_path() -> Result<PathBuf, String> {
+    Ok(launcher_data_dir()?.join("moderation.json"))
+}
+
+fn load_moderation_cache() -> Option<ModerationState> {
+    let text = fs::read_to_string(moderation_cache_path().ok()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_moderation_cache(state: &ModerationState) {
+    if let Ok(path) = moderation_cache_path() {
+        if let Ok(text) = serde_json::to_string_pretty(state) { let _ = fs::write(path, text); }
+    }
+}
+
+/// Fresh lists from the server; the last cached copy when the server cannot be reached.
+async fn refresh_moderation() -> ModerationState {
+    let fetched = server_api_raw("/mods/moderation", None).await
+        .and_then(|text| serde_json::from_str::<ModerationState>(&text).map_err(|e| format!("Некорректный ответ сервера: {e}")));
+    match fetched {
+        Ok(state) => { save_moderation_cache(&state); state }
+        Err(e) => {
+            eprintln!("[MOD] moderation lists unavailable, using the cached copy: {e}");
+            load_moderation_cache().unwrap_or_default()
+        }
+    }
+}
+
+/// Catalog mods that a moderator has since blocked are moved out of `mods` (into `mods-blocked`).
+fn enforce_blocked_mods(game_path: &Path) {
+    let Some(moderation) = load_moderation_cache() else { return };
+    let mut state = load_modrinth_state();
+    let mods_dir = game_path.join("mods");
+    let blocked_dir = game_path.join("mods-blocked");
+    let mut changed = false;
+    for id in &moderation.blocked {
+        if let Some(installed) = state.installed.remove(id) {
+            let path = mods_dir.join(&installed.filename);
+            if path.is_file() {
+                let _ = fs::create_dir_all(&blocked_dir);
+                let _ = fs::rename(&path, blocked_dir.join(&installed.filename));
+            }
+            changed = true;
+        }
+    }
+    if changed { let _ = save_modrinth_state(&state); }
+}
+
+/// Current server-wide moderation lists (works from the cache when the server is offline).
+#[tauri::command]
+async fn get_moderation() -> Result<ModerationState, String> {
+    Ok(refresh_moderation().await)
+}
+
+/// Moderator action: block/unblock a Modrinth project, approve/unapprove a mod file by its SHA-256.
+/// The server accepts it only from a configured moderator account and checks that account's password.
+#[tauri::command]
+async fn moderate_mod(nickname: String, password: String, action: String, key: String, title: Option<String>) -> Result<ModerationState, String> {
+    let body = serde_json::to_string(&serde_json::json!({
+        "nickname": nickname,
+        "password": password,
+        "action": action,
+        "key": key,
+        "title": title.unwrap_or_default(),
+    })).map_err(|e| e.to_string())?;
+    let reply = server_api_call("/mods/moderate", Some(body)).await?;
+    match reply.status.as_str() {
+        "ok" => Ok(refresh_moderation().await),
+        "forbidden" => Err("Управлять модами может только модератор".into()),
+        "invalid_password" => Err("Неверный пароль модератора".into()),
+        other => Err(reply.error.clone().unwrap_or_else(|| format!("Сервер модерации: {other}"))),
+    }
 }
 
 /// Minimal percent-encoding for query values (RFC 3986 unreserved characters stay as-is).
@@ -2736,7 +2941,8 @@ fn main() {
             modrinth_search,
             modrinth_install_mod,
             get_extra_mods_state,
-            set_mod_blocked,
+            get_moderation,
+            moderate_mod,
             open_external_url,
             server_auth_register,
             server_auth_login,
@@ -2772,5 +2978,24 @@ mod server_auth_tests {
         let (first, _) = signed_headers("secret", "body-a");
         let (second, _) = signed_headers("secret", "body-b");
         assert_ne!(first.split(",v1=").nth(1), second.split(",v1=").nth(1));
+    }
+    /// Network test: the pack file list must be readable from the real release without downloading the pack.
+    #[test]
+    #[ignore]
+    fn reads_pack_file_list_from_github() {
+        let url = "https://github.com/YaroslavPetrushenko/GorizontLauncher/releases/download/pack-2.6.0/modpack.zip";
+        let names = tauri::async_runtime::block_on(remote_zip_names(url)).expect("read central directory");
+        let jars = names.iter().filter(|n| n.starts_with("mods/") && n.ends_with(".jar")).count();
+        assert_eq!(jars, 57, "mod jars in pack-2.6.0, names: {:?}", &names[..names.len().min(5)]);
+        assert!(names.iter().any(|n| n == "manifest.json"));
+    }
+
+    #[test]
+    fn client_only_facets_exclude_server_mods() {
+        let facets = modrinth_facets("1.21.1", "neoforge", &[]).to_string();
+        assert!(facets.contains("client_side:required") && facets.contains("client_side:optional"));
+        assert!(!facets.contains("client_side:unknown"));
+        assert!(facets.contains("server_side:unsupported") && facets.contains("server_side:optional"));
+        assert!(!facets.contains("server_side:required"));
     }
 }

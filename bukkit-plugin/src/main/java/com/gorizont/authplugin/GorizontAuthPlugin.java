@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -77,11 +78,13 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
     private boolean rememberIngameLogin;
     private boolean blockSameNameTakeover;
     private boolean hidePasswordsInLog;
+    private Set<String> moderators = Set.of();
 
     // State
     private AccountStore accounts;
     private LauncherSessions sessions;
     private BruteForceGuard guard;
+    private ModerationStore moderation;
     private AuthHttpServer httpServer;
 
     private final Set<String> authenticatedPlayers = ConcurrentHashMap.newKeySet();
@@ -95,6 +98,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
 
         accounts = new AccountStore(getDataFolder(), passwordMinLength, getLogger());
         sessions = new LauncherSessions(getDataFolder(), launcherSessionMinutes, bindSessionToIp, getLogger());
+        moderation = new ModerationStore(getDataFolder(), getLogger());
 
         getServer().getPluginManager().registerEvents(this, this);
 
@@ -138,7 +142,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
 
     private void startApi() {
         try {
-            httpServer = new AuthHttpServer(getLogger(), accounts, hmacSecret, signatureMaxSkewSeconds, rateLimitPerMinute, sessions, passwordMinLength, guard);
+            httpServer = new AuthHttpServer(getLogger(), accounts, hmacSecret, signatureMaxSkewSeconds, rateLimitPerMinute, sessions, passwordMinLength, guard, moderation, moderators);
             httpServer.start(apiHost, apiPort);
             if (!httpServer.isSigningConfigured()) {
                 getLogger().warning("auth.hmacSecret is empty — every launcher request will be rejected until it matches the launcher key");
@@ -158,6 +162,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         config.addDefault("auth.rememberIngameLogin", true);
         config.addDefault("auth.blockSameNameTakeover", true);
         config.addDefault("auth.hidePasswordsInLog", true);
+        config.addDefault("auth.moderators", List.of("OgonickYT"));
 
         enableAuth = config.getBoolean("auth.enableAuth", true);
         apiHost = config.getString("auth.apiHost", "0.0.0.0");
@@ -176,6 +181,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         rememberIngameLogin = config.getBoolean("auth.rememberIngameLogin", true);
         blockSameNameTakeover = config.getBoolean("auth.blockSameNameTakeover", true);
         hidePasswordsInLog = config.getBoolean("auth.hidePasswordsInLog", true);
+        moderators = config.getStringList("auth.moderators").stream().map(n -> n.toLowerCase(Locale.ROOT)).collect(java.util.stream.Collectors.toUnmodifiableSet());
         config.options().copyDefaults(true);
         saveConfig();
 
@@ -205,6 +211,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         config.set("auth.rememberIngameLogin", true);
         config.set("auth.blockSameNameTakeover", true);
         config.set("auth.hidePasswordsInLog", true);
+        config.set("auth.moderators", List.of("OgonickYT"));
         config.options().copyDefaults(true);
         saveConfig();
     }
@@ -620,6 +627,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                     sender.sendMessage("  Launcher sessions: " + sessions.size() + (bindSessionToIp ? " (привязаны к IP)" : " (БЕЗ привязки к IP)"));
                     sender.sendMessage("  Authenticated players: " + authenticatedPlayers.size());
                     sender.sendMessage("  Locked addresses: " + guard.lockedCount());
+                    sender.sendMessage("  Moderators: " + moderators + ", blocked mods: " + moderation.blockedCount() + ", approved mods: " + moderation.approvedCount());
                     break;
                 case "unlock": {
                     if (args.length < 2) {

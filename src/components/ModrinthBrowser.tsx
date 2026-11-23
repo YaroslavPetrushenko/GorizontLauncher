@@ -5,6 +5,7 @@ import {
   Unlock, ChevronDown, Package, ArrowDownToLine, ShieldAlert,
 } from 'lucide-react';
 import type { Key, T } from '../i18n';
+import { isModerator } from '../config';
 
 /**
  * Backend contract (Tauri commands):
@@ -40,11 +41,12 @@ interface ModrinthSearchResponse {
 interface ExtraModsState {
   installed: string[];
   blocked: string[];
+  titles?: Record<string, string>;
 }
 
 type SortIndex = 'relevance' | 'downloads' | 'newest';
 
-type Props = { t: T; gameDir: string; gameVersion: string; loader: string };
+type Props = { t: T; gameDir: string; gameVersion: string; loader: string; username: string; askPassword: () => Promise<string | null>; forgetPassword: () => void };
 
 const CATEGORIES: { id: string; key: Key }[] = [
   { id: 'optimization', key: 'catOptimization' },
@@ -85,7 +87,8 @@ function formatDownloads(count: number): string {
   return String(count);
 }
 
-export default function ModrinthBrowser({ t, gameDir, gameVersion, loader }: Props) {
+export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, username, askPassword, forgetPassword }: Props) {
+  const moderator = isModerator(username);
   const [query, setQuery] = useState('');
   const [submittedQuery, setSubmittedQuery] = useState('');
   const [categories, setCategories] = useState<string[]>([]);
@@ -109,6 +112,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader }: Pro
       const state = await invoke<ExtraModsState>('get_extra_mods_state');
       setInstalled(new Set(state.installed ?? []));
       setBlocked(new Set(state.blocked ?? []));
+      if (state.titles) setTitles(prev => ({ ...prev, ...state.titles }));
     } catch {
       // Older build without the command: behave as if nothing is installed or blocked.
     }
@@ -172,10 +176,18 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader }: Pro
   };
 
   const setBlockedState = async (projectId: string, next: boolean, title?: string) => {
+    if (!moderator) return;
     setBusyId(projectId);
     setModError(prev => ({ ...prev, [projectId]: '' }));
     try {
-      await invoke('set_mod_blocked', { projectId, blocked: next });
+      const password = await askPassword();
+      if (!password) return;
+      try {
+        await invoke('moderate_mod', { nickname: username, password, action: next ? 'block' : 'unblock', key: projectId, title: title ?? titles[projectId] ?? '' });
+      } catch (e) {
+        forgetPassword();
+        throw e;
+      }
       if (next && title) {
         rememberTitle(projectId, title);
         setTitles(prev => ({ ...prev, [projectId]: title }));
@@ -319,14 +331,14 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader }: Pro
                     {isBusy ? <Loader2 size={14} className="spin" /> : isInstalled ? <Check size={14} /> : <Download size={14} />}
                     {isBusy ? t('mrInstalling') : isInstalled ? t('mrInstalled') : t('mrInstall')}
                   </button>
-                  <button
+                  {moderator && <button
                     className="mr-btn danger"
                     onClick={() => setBlockedState(hit.projectId, true, hit.title)}
                     disabled={isBusy}
                     title={t('mrBlockHint')}
                   >
                     <Ban size={14} /> {t('mrBlock')}
-                  </button>
+                  </button>}
                 </div>
               </article>
             );
@@ -341,7 +353,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader }: Pro
         </button>
       )}
 
-      <div className="mr-blocked-section">
+      {moderator && <div className="mr-blocked-section">
         <button className="mr-blocked-toggle" onClick={() => setShowBlocked(v => !v)} aria-expanded={showBlocked}>
           <ShieldAlert size={15} />
           {t('mrBlockedTitle')} ({blockedCount})
@@ -369,7 +381,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader }: Pro
             </div>
           )
         )}
-      </div>
+      </div>}
 
       <p className="mr-footer">{t('mrFooter')}</p>
     </div>

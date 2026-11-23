@@ -12,7 +12,9 @@ import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -42,6 +44,8 @@ public final class AuthHttpServer {
     private final int rateLimitPerMinute;
     private final LauncherSessions sessions;
     private final int passwordMinLength;
+    private final ModerationStore moderation;
+    private final Set<String> moderators;
 
     private HttpServer server;
     private ExecutorService executor;
@@ -50,8 +54,11 @@ public final class AuthHttpServer {
     private final Map<String, Long> usedNonces = new ConcurrentHashMap<>();
 
     public AuthHttpServer(Logger logger, AccountStore accounts, String hmacSecret, int maxSkewSeconds,
-                          int rateLimitPerMinute, LauncherSessions sessions, int passwordMinLength, BruteForceGuard guard) {
+                          int rateLimitPerMinute, LauncherSessions sessions, int passwordMinLength, BruteForceGuard guard,
+                          ModerationStore moderation, Set<String> moderators) {
         this.logger = logger;
+        this.moderation = moderation;
+        this.moderators = moderators;
         this.guard = guard;
         this.accounts = accounts;
         this.hmacSecret = hmacSecret == null ? "" : hmacSecret;
@@ -73,6 +80,8 @@ public final class AuthHttpServer {
         server.createContext("/auth/register", this::handleRegister);
         server.createContext("/auth/login", this::handleLogin);
         server.createContext("/auth/check-player", this::handleCheckPlayer);
+        server.createContext("/mods/moderation", this::handleModerationList);
+        server.createContext("/mods/moderate", this::handleModerate);
         server.start();
         logger.info("Auth API listening on " + host + ":" + port);
     }
@@ -190,6 +199,71 @@ public final class AuthHttpServer {
             }
         }
         respond(exchange, 200, reply.toString());
+    }
+
+    // ==================== MOD MODERATION ====================
+
+    /** Public (signed) read of the server-wide lists: blocked Modrinth projects and approved mod hashes. */
+    private void handleModerationList(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            respond(exchange, 405, "{\"error\":\"method not allowed\"}");
+            return;
+        }
+        String ip = remoteIp(exchange);
+        if (!allowRequest(ip)) {
+            respond(exchange, 429, "{\"error\":\"rate limited\"}");
+            return;
+        }
+        if (!verifySignature(exchange, "")) {
+            respond(exchange, 401, "{\"error\":\"invalid signature\"}");
+            return;
+        }
+        respond(exchange, 200, moderation.snapshot().toString());
+    }
+
+    /**
+     * A moderator changes the lists. The nickname must be on the configured moderator list AND the request must
+     * carry that account's password, which is checked like a normal login (same brute-force guard). The launcher
+     * shows the controls only to moderators, but this check is the real protection.
+     */
+    private void handleModerate(HttpExchange exchange) throws IOException {
+        withSignedJson(exchange, (body, ip) -> {
+            JsonObject reply = new JsonObject();
+            String nickname = stringField(body, "nickname");
+            String password = stringField(body, "password");
+            String action = stringField(body, "action");
+            String key = stringField(body, "key");
+            String title = stringField(body, "title");
+
+            long lockedMillis = guard.lockRemainingMillis(ip);
+            if (lockedMillis > 0) {
+                reply.addProperty("status", "locked");
+                reply.addProperty("error", "Слишком много неудачных попыток. Повторите через " + Math.max(1, lockedMillis / 60_000L) + " мин.");
+                return reply;
+            }
+            if (!moderators.contains(nickname.toLowerCase(Locale.ROOT))) {
+                guard.recordFailure(ip);
+                reply.addProperty("status", "forbidden");
+                reply.addProperty("error", "Управлять модами может только модератор");
+                logger.warning("Moderation refused for non-moderator '" + nickname + "' from " + ip);
+                return reply;
+            }
+            AccountStore.LoginResult login = accounts.login(nickname, password);
+            if (login != AccountStore.LoginResult.OK) {
+                guard.recordFailure(ip);
+                reply.addProperty("status", login == AccountStore.LoginResult.ERROR ? "error" : "invalid_password");
+                reply.addProperty("error", "Неверный пароль модератора");
+                return reply;
+            }
+            if (!moderation.apply(action, key, title)) {
+                reply.addProperty("status", "invalid_input");
+                reply.addProperty("error", "Некорректное действие или идентификатор");
+                return reply;
+            }
+            reply.addProperty("status", "ok");
+            logger.info("Moderator " + nickname + " did '" + action + "' on " + key + (title.isEmpty() ? "" : " (" + title + ")"));
+            return reply;
+        });
     }
 
     // ==================== SIGNED JSON PLUMBING ====================

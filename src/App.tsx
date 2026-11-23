@@ -12,6 +12,7 @@ import News, { ServerCard, useServerStatus } from './components/News';
 import UserMods from './components/UserMods';
 import ExtraMods from './components/ExtraMods';
 import ModrinthBrowser from './components/ModrinthBrowser';
+import { useModeratorPassword } from './components/ModeratorPassword';
 import { clearAccount, loadAccount, saveAccount, type Account } from './account';
 import { saveAuthResponse, clearAuth, tryAutoLogin, type AuthResponse } from './api';
 import { detectLang, makeT, type Lang } from './i18n';
@@ -41,6 +42,7 @@ export default function App() {
 
   const lang: Lang = settings.lang ?? detectLang();
   const t = useMemo(() => makeT(lang), [lang]);
+  const moderator = useModeratorPassword(t);
   const server = useServerStatus();
 
   // Auto-login on startup
@@ -215,13 +217,13 @@ export default function App() {
 
         {activeTab === 'mods' && (
           <section className="mods-section">
-            <UserMods t={t} gameDir={settings.gameDir} />
+            <UserMods t={t} gameDir={settings.gameDir} username={account.username} askPassword={moderator.ask} forgetPassword={moderator.forget} />
           </section>
         )}
 
         {activeTab === 'extra' && (
           <section className="mods-section">
-            <ModrinthBrowser t={t} gameDir={settings.gameDir} gameVersion="1.21.1" loader="neoforge" />
+            <ModrinthBrowser t={t} gameDir={settings.gameDir} gameVersion="1.21.1" loader="neoforge" username={account.username} askPassword={moderator.ask} forgetPassword={moderator.forget} />
           </section>
         )}
 
@@ -234,6 +236,7 @@ export default function App() {
       </main>}
 
     <footer><span>GORIZONT LAUNCHER <b>v{version}</b></span><span><Download size={14} /> {t('autoUpdate')}</span></footer>
+    {moderator.dialog}
     {showSettings && account && <SettingsPanel memory={memory} t={t} lang={lang} settings={settings} username={account.username} onSave={persistSettings} onLogout={logout} onClose={() => setShowSettings(false)} />}
     {progress && busy && <UpdateOverlay t={t} progress={progress} />}
     {launcherUpdate && !busy && <LauncherUpdateBanner t={t} update={launcherUpdate} onClose={() => setLauncherUpdate(null)} onInstall={installLauncherUpdate} />}

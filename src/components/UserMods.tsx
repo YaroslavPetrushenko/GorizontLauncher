@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Check, X, Eye, EyeOff, RefreshCw, Trash2, ShieldCheck, ShieldAlert, FileText, Loader2 } from 'lucide-react';
 import type { T } from '../i18n';
+import { isModerator } from '../config';
 
 interface UserMod {
   id: string;
@@ -20,9 +21,13 @@ interface UserModsManifest {
 type Props = {
   t: T;
   gameDir: string;
+  username: string;
+  askPassword: () => Promise<string | null>;
+  forgetPassword: () => void;
 };
 
-export default function UserMods({ t, gameDir }: Props) {
+export default function UserMods({ t, gameDir, username, askPassword, forgetPassword }: Props) {
+  const moderator = isModerator(username);
   const [mods, setMods] = useState<UserMod[]>([]);
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -66,11 +71,24 @@ export default function UserMods({ t, gameDir }: Props) {
     }
   };
 
+  // Approval is decided by the moderator and kept on the server for every player; the server checks the
+  // moderator account's password, so hiding the button for others is only a convenience.
   const toggleApproved = async (modId: string, approved: boolean) => {
+    if (!moderator) return;
+    const target = mods.find(m => m.id === modId);
+    if (!target) return;
     setError('');
     try {
-      await invoke<UserModsManifest>('approve_user_mod', { gameDir, modId, approved });
-      setMods(prev => prev.map(m => m.id === modId ? { ...m, approved } : m));
+      const password = await askPassword();
+      if (!password) return;
+      try {
+        await invoke('moderate_mod', { nickname: username, password, action: approved ? 'approve' : 'unapprove', key: target.hash, title: target.filename });
+      } catch (e) {
+        forgetPassword();
+        throw e;
+      }
+      const manifest = await invoke<UserModsManifest>('approve_user_mod', { gameDir, modId, approved });
+      setMods(Object.values(manifest.mods).sort((a, b) => a.filename.localeCompare(b.filename)));
     } catch (e) {
       setError(String(e));
     }
@@ -172,13 +190,13 @@ export default function UserMods({ t, gameDir }: Props) {
                 >
                   {mod.enabled ? <Eye size={16} /> : <EyeOff size={16} />}
                 </button>
-                <button
+                {moderator && <button
                   className={`mod-action-btn ${mod.approved ? 'active approved' : ''}`}
                   onClick={() => toggleApproved(mod.id, !mod.approved)}
                   title={mod.approved ? t('userModsUnapprove') : t('userModsApprove')}
                 >
                   {mod.approved ? <ShieldCheck size={16} /> : <ShieldAlert size={16} />}
-                </button>
+                </button>}
                 <button
                   className="mod-action-btn danger"
                   onClick={() => removeMod(mod.id)}
