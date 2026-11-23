@@ -21,6 +21,15 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - run: npm ci --no-audit --no-fund
+      - name: Require the game server key
+        shell: bash
+        env:
+          GORIZONT_HMAC_SECRET: ${{ secrets.GORIZONT_HMAC_SECRET }}
+        run: |
+          if [ -z "$GORIZONT_HMAC_SECRET" ]; then
+            echo "::error::The GitHub secret GORIZONT_HMAC_SECRET is not set. A launcher built without it cannot talk to the game server, so the release is not built."
+            exit 1
+          fi
       - run: npm run tauri build
         env:
           # Baked into the launcher with option_env!; never committed to the repository.

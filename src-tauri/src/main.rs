@@ -174,7 +174,7 @@ struct LauncherConfig {
     server_api_url: String,
 }
 
-fn default_server_api_url() -> String { "http://gp-ru-2.apexnodes.xyz:22754".to_string() }
+fn default_server_api_url() -> String { "http://mc.gorizont.fun:22754".to_string() }
 
 fn default_launcher_api_port() -> u16 { 22754 }
 
@@ -1727,7 +1727,8 @@ async fn auth_login(
     request: LoginRequest,
 ) -> Result<AuthResponse, String> {
     // The game server is the source of truth for accounts; fall back to the local
-    // mirror only when the server is unreachable or no shared key is configured.
+    // mirror only when the server is unreachable.
+    require_server_key()?;
     if server_hmac_secret().is_some() {
         match server_auth_login(request.nickname.clone(), request.password.clone()).await {
             Ok(reply) => match reply.status.as_str() {
@@ -1752,6 +1753,7 @@ async fn auth_register(
     active: State<'_, ActiveAccountState>,
     request: RegisterRequest,
 ) -> Result<AuthResponse, String> {
+    require_server_key()?;
     if server_hmac_secret().is_some() {
         match server_auth_register(request.nickname.clone(), request.password.clone()).await {
             Ok(reply) => match reply.status.as_str() {
@@ -2552,6 +2554,14 @@ fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
 /// A runtime environment variable is honoured only for local development.
 /// Honest limitation: the key ships inside the exe and can be extracted, so this
 /// protects against random/accidental requests, not against a targeted attacker.
+/// A launcher built without the server key cannot talk to the game server. It must say so: silently creating a
+/// local-only account makes the player think they are logged in while the server has never heard of them, and
+/// the game then asks for /register or /login.
+fn require_server_key() -> Result<(), String> {
+    if server_hmac_secret().is_some() { return Ok(()); }
+    Err("В этой сборке лаунчера нет ключа сервера авторизации, поэтому вход и регистрация через сервер невозможны. Скачайте свежую версию лаунчера.".into())
+}
+
 fn server_hmac_secret() -> Option<String> {
     let embedded = option_env!("GORIZONT_HMAC_SECRET").unwrap_or("").trim();
     if !embedded.is_empty() { return Some(embedded.to_string()); }
@@ -3042,5 +3052,18 @@ mod server_auth_tests {
 
         match previous_appdata { Some(v) => env::set_var("LOCALAPPDATA", v), None => env::remove_var("LOCALAPPDATA") }
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_launcher_without_the_server_key_refuses_instead_of_going_local() {
+        let _guard = APPDATA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = env::var("GORIZONT_HMAC_SECRET").ok();
+        env::remove_var("GORIZONT_HMAC_SECRET");
+        if option_env!("GORIZONT_HMAC_SECRET").unwrap_or("").trim().is_empty() {
+            let message = require_server_key().expect_err("no key: must refuse");
+            assert!(message.contains("нет ключа"), "{message}");
+        }
+        env::set_var("GORIZONT_HMAC_SECRET", "some-key");
+        assert!(require_server_key().is_ok());
+        match previous { Some(v) => env::set_var("GORIZONT_HMAC_SECRET", v), None => env::remove_var("GORIZONT_HMAC_SECRET") }
     }
 }
