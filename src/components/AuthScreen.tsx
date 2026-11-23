@@ -1,11 +1,10 @@
 import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { ShieldCheck, UserRound, Lock, AlertCircle, Eye, EyeOff, Loader2, Github, Chrome } from 'lucide-react';
+import { ShieldCheck, UserRound, Lock, AlertCircle, Eye, EyeOff, Loader2 } from 'lucide-react';
 import type { T } from '../i18n';
 import { validNick, type Account } from '../account';
 
 type AuthMode = 'login' | 'register' | 'forgot';
-type OAuthProvider = 'google' | 'microsoft';
 
 interface AuthResponse {
   access_token: string;
@@ -33,12 +32,6 @@ interface RegisterRequest {
 
 interface ForgotPasswordRequest {
   nickname: string;
-}
-
-interface OAuthRequest {
-  provider: string;
-  code: string;
-  device_fp: string;
 }
 
 type Props = { t: T; onDone: (account: Account) => void };
@@ -84,7 +77,7 @@ export default function AuthScreen({ t, onDone }: Props) {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [nickname, mode]);
 
-  const validatePassword = useCallback((p: string) => p.length >= 8, []);
+  const validatePassword = useCallback((p: string) => p.length >= 4, []);
   const validateNickname = useCallback((n: string) => validNick(n), []);
 
   const switchMode = useCallback((newMode: AuthMode) => {
@@ -178,26 +171,6 @@ export default function AuthScreen({ t, onDone }: Props) {
     }
   };
 
-  const handleOAuth = async (provider: OAuthProvider) => {
-    setBusy(true);
-    setError('');
-    try {
-      // For OAuth, we need to open a popup/window and get the auth code
-      // This is a placeholder - full OAuth flow needs a webview or popup
-      const request: OAuthRequest = { provider, code: '', device_fp: deviceFp };
-      const response = await invoke<AuthResponse>('auth_oauth', { request });
-      handleAuthSuccess(response);
-      setSuccess(t('authSuccess'));
-    } catch (e) {
-      const err = String(e);
-      if (err.includes('network') || err.includes('Network') || err.includes('fetch')) {
-        setError(t('authErrorNetwork'));
-      } else {
-        setError(t('authErrorServer'));
-      }
-    } finally { setBusy(false); }
-  };
-
   const renderLoginForm = () => (
     <>
       <label>
@@ -243,15 +216,6 @@ export default function AuthScreen({ t, onDone }: Props) {
       <button className="primary-button" type="submit" disabled={busy}>
         {busy ? <Loader2 size={18} className="spin" /> : t('authSubmitLogin')}
       </button>
-      <div className="divider"><span>{t('authDivider')}</span></div>
-      <div className="oauth-buttons">
-        <button type="button" className="oauth-button" onClick={() => handleOAuth('google')} disabled={busy}>
-          <Chrome size={18} /> {t('authOAuthGoogle')}
-        </button>
-        <button type="button" className="oauth-button" onClick={() => handleOAuth('microsoft')} disabled={busy}>
-          <Github size={18} /> {t('authOAuthMicrosoft')}
-        </button>
-      </div>
       <p className="auth-switch">{t('authBackToRegister')} <button type="button" className="link-button" onClick={() => switchMode('register')}>{t('authRegister')}</button></p>
     </>
   );
@@ -312,15 +276,6 @@ export default function AuthScreen({ t, onDone }: Props) {
       <button className="primary-button" type="submit" disabled={busy}>
         {busy ? <Loader2 size={18} className="spin" /> : t('authSubmitRegister')}
       </button>
-      <div className="divider"><span>{t('authDivider')}</span></div>
-      <div className="oauth-buttons">
-        <button type="button" className="oauth-button" onClick={() => handleOAuth('google')} disabled={busy}>
-          <Chrome size={18} /> {t('authOAuthGoogle')}
-        </button>
-        <button type="button" className="oauth-button" onClick={() => handleOAuth('microsoft')} disabled={busy}>
-          <Github size={18} /> {t('authOAuthMicrosoft')}
-        </button>
-      </div>
       <p className="auth-switch">{t('authBackToLogin')} <button type="button" className="link-button" onClick={() => switchMode('login')}>{t('authLogin')}</button></p>
     </>
   );

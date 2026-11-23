@@ -66,13 +66,6 @@ pub struct ForgotPasswordRequest {
     pub nickname: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OAuthRequest {
-    pub provider: String,
-    pub code: String,
-    pub device_fp: String,
-}
-
 /// Secret used to sign the launcher's own access/refresh tokens.
 ///
 /// There is no default in the repository: a random secret is generated on first run
@@ -178,7 +171,7 @@ pub async fn register_user(
 ) -> Result<AuthResponse, String> {
     let nickname = nickname.trim().to_string();
     
-    if nickname.is_empty() || password.len() < 8 {
+    if nickname.is_empty() || password.len() < 4 {
         return Err("Invalid input".to_string());
     }
     
@@ -433,152 +426,6 @@ pub async fn forgot_password(
         .map_err(|e| format!("DB error: {}", e))?;
     
     Ok(())
-}
-
-pub async fn oauth_login(
-    pool: &DbPool,
-    provider: &str,
-    provider_user_id: &str,
-    nickname: &str,
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    device_fp: &str,
-) -> Result<AuthResponse, String> {
-    let nickname = nickname.trim().to_string();
-    
-    let oauth_row = sqlx::query(
-        "SELECT user_id FROM oauth_accounts WHERE provider = ? AND provider_user_id = ?"
-    )
-    .bind(provider)
-    .bind(provider_user_id)
-    .fetch_optional(pool.as_ref())
-    .await
-    .map_err(|e| format!("DB error: {}", e))?;
-    
-    let user_id = if let Some(row) = oauth_row {
-        let existing_user_id: String = row.get("user_id");
-        
-        sqlx::query(
-            "UPDATE oauth_accounts SET access_token_enc = ?, refresh_token_enc = ?, expires_at = ? WHERE provider = ? AND provider_user_id = ?"
-        )
-        .bind(access_token.unwrap_or_default())
-        .bind(refresh_token.unwrap_or_default())
-        .bind(Utc::now().to_rfc3339())
-        .bind(provider)
-        .bind(provider_user_id)
-        .execute(pool.as_ref())
-        .await
-        .map_err(|e| format!("Failed to update oauth account: {}", e))?;
-        
-        existing_user_id
-    } else {
-        let user_row = sqlx::query("SELECT id FROM users WHERE nickname = ?")
-            .bind(&nickname)
-            .fetch_optional(pool.as_ref())
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-        
-        let user_id = if let Some(row) = user_row {
-            let existing_user_id: String = row.get("id");
-            
-            sqlx::query(
-                "UPDATE users SET nickname = ? WHERE id = ?"
-            )
-            .bind(&nickname)
-            .bind(&existing_user_id)
-            .execute(pool.as_ref())
-            .await
-            .map_err(|e| format!("Failed to update user: {}", e))?;
-            
-            sqlx::query(
-                "INSERT INTO oauth_accounts (id, user_id, provider, provider_user_id, access_token_enc, refresh_token_enc, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(&existing_user_id)
-            .bind(provider)
-            .bind(provider_user_id)
-            .bind(access_token.unwrap_or_default())
-            .bind(refresh_token.unwrap_or_default())
-            .bind(Utc::now().to_rfc3339())
-            .bind(Utc::now().to_rfc3339())
-            .execute(pool.as_ref())
-            .await
-            .map_err(|e| format!("Failed to link oauth account: {}", e))?;
-            
-            existing_user_id
-        } else {
-            let new_user_id = Uuid::new_v4().to_string();
-            let now = Utc::now().to_rfc3339();
-            
-            sqlx::query(
-                "INSERT INTO users (id, password_hash, nickname, created_at) VALUES (?, '', ?, ?)"
-            )
-            .bind(&new_user_id)
-            .bind(&nickname)
-            .bind(&now)
-            .execute(pool.as_ref())
-            .await
-            .map_err(|e| format!("Failed to create user: {}", e))?;
-            
-            sqlx::query(
-                "INSERT INTO oauth_accounts (id, user_id, provider, provider_user_id, access_token_enc, refresh_token_enc, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(&new_user_id)
-            .bind(provider)
-            .bind(provider_user_id)
-            .bind(access_token.unwrap_or_default())
-            .bind(refresh_token.unwrap_or_default())
-            .bind(Utc::now().to_rfc3339())
-            .bind(&now)
-            .execute(pool.as_ref())
-            .await
-            .map_err(|e| format!("Failed to create oauth account: {}", e))?;
-            
-            new_user_id
-        };
-        
-        user_id
-    };
-    
-    let user_row = sqlx::query("SELECT id, nickname, created_at FROM users WHERE id = ?")
-        .bind(&user_id)
-        .fetch_one(pool.as_ref())
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
-    
-    let nickname: String = user_row.get("nickname");
-    let created_at: String = user_row.get("created_at");
-    
-    let access_token = create_access_token(&user_id, &nickname)?;
-    let refresh_token = create_refresh_token(&user_id, &nickname)?;
-    let refresh_token_hash = hash_token(&refresh_token);
-    let session_id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    let expires_at = (Utc::now() + Duration::days(REFRESH_TOKEN_TTL_DAYS)).to_rfc3339();
-    
-    sqlx::query(
-        "INSERT INTO user_sessions (id, user_id, refresh_token_hash, device_fp, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)"
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&refresh_token_hash)
-    .bind(device_fp)
-    .bind(&expires_at)
-    .bind(&now)
-    .execute(pool.as_ref())
-    .await
-    .map_err(|e| format!("Failed to create session: {}", e))?;
-    
-    Ok(AuthResponse {
-        access_token,
-        refresh_token,
-        user: UserResponse {
-            id: user_id,
-            nickname,
-            created_at,
-        },
-    })
 }
 
 #[cfg(test)]

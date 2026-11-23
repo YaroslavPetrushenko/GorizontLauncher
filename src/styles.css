@@ -42,12 +42,6 @@ input[type=range]:disabled{opacity:.4}.range-labels{gap:8px}
 .auth-tab{flex:1;height:36px;border:0;border-radius:6px;background:transparent;color:#a1a1aa;font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s ease}
 .auth-tab:hover{color:#facc15}
 .auth-tab.active{background:linear-gradient(135deg,#facc15,#f97316);color:#171717;box-shadow:0 2px 8px #f9731630}
-.divider{display:flex;align-items:center;gap:12px;margin:16px 0;color:#71717a;font-size:10px;letter-spacing:1px}
-.divider::before,.divider::after{content:'';flex:1;height:1px;background:#2b2b2b}
-.oauth-buttons{display:flex;flex-direction:column;gap:8px}
-.oauth-button{display:flex;align-items:center;justify-content:center;gap:10px;height:43px;border:1px solid #2b2b2b;border-radius:7px;background:#111;color:#a1a1aa;font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s ease}
-.oauth-button:hover{border-color:#facc15;color:#facc15;background:#facc1510}
-.oauth-button:disabled{opacity:.5;cursor:not-allowed}
 .auth-switch{margin:16px 0 0;text-align:center;color:#71717a;font-size:11px}
 .auth-switch .link-button{font-size:11px;font-weight:600}
 .login-options{display:flex;justify-content:space-between;align-items:center;margin:4px 0 8px}
@@ -235,3 +229,50 @@ footer{height:44px;display:flex;align-items:center;justify-content:space-between
 .mr-badge.blocked{color:#fca5a5;border-color:#ef444466;background:#ef444418}
 .mr-blocked-item{gap:8px}
 .mr-blocked-item .mr-btn{flex:0 0 auto}
+
+/* ---- fluid layout: any window size from 860x560 up to a 4K monitor -------------------------------------------------
+   One horizontal inset (--pad) is shared by the top bar, the content and the footer, so their edges line up. It grows
+   on wide screens, which keeps the content in a centred column instead of pinning it to both edges. Sizes that carry
+   text scale with the window height, so the home screen fits the minimum height without being clipped. */
+:root{--pad:max(clamp(24px,4vw,64px),calc((100vw - 1360px) / 2 + 64px))}
+.app-shell>.topbar{height:clamp(52px,8vh,72px);padding-left:var(--pad);padding-right:var(--pad)}
+.app-shell>footer{padding-left:var(--pad);padding-right:var(--pad)}
+.app-shell>.content{padding-left:var(--pad);padding-right:var(--pad);gap:clamp(24px,4vw,64px);grid-template-columns:minmax(0,1fr) clamp(260px,27vw,380px)}
+.app-shell>.content.auth-content{padding-left:24px;padding-right:24px;overflow-y:auto}
+.app-shell>.content>.main-tabs{margin:clamp(8px,1.8vh,18px) 0 0;flex-wrap:wrap;row-gap:6px}
+.app-shell>.content .hero{max-width:640px}
+.app-shell>.content .hero h1{font-size:clamp(30px,6.4vh,54px);margin:clamp(6px,1.5vh,14px) 0 clamp(6px,1.5vh,14px)}
+.app-shell>.content .hero-copy{font-size:clamp(12px,1.8vh,14px);margin:0 0 clamp(8px,2.2vh,20px)}
+.app-shell>.content .welcome-chip{margin-bottom:clamp(6px,1.4vh,12px)}
+.app-shell>.content .security-note{margin-top:clamp(6px,1.4vh,12px)}
+.app-shell>.content .news{min-width:0}
+.auth-card{max-width:100%}
+
+/* short windows: drop the decorative paragraph so the home screen always fits */
+@media (max-height:640px){
+  .app-shell>.content .hero-copy{display:none}
+  .app-shell>.content .hero h1{font-size:clamp(28px,6.2vh,40px)}
+  .pack-line{margin:0 0 8px}
+}
+/* narrow windows: tighter columns */
+@media (max-width:980px){
+  .app-shell>.content{gap:24px;grid-template-columns:minmax(0,1fr) 250px}
+  .app-shell>.content .news{padding-left:16px}
+  .app-shell>.topbar{padding-left:28px;padding-right:28px}
+}
+
+/* ---- sign-in / registration screen ------------------------------------------------------------------------------------
+   The card is centred with auto margins: when the window is lower than the card, the card starts at the top and the
+   screen scrolls, instead of being cut off at the top (which is what centring with align-items does). */
+.app-shell>.content.auth-content{align-items:flex-start;justify-content:center;overflow-y:auto;padding-top:clamp(12px,3vh,40px);padding-bottom:clamp(12px,3vh,40px)}
+.app-shell>.content.auth-content>.auth-card{margin:auto 0;flex:0 0 auto}
+.input-wrapper{width:100%}
+.input-wrapper .text-input{flex:1 1 auto;min-width:0;width:100%}
+.auth-card label.check-row{flex-direction:row;align-items:center;gap:8px;font-size:12px;letter-spacing:0;font-weight:500;color:#d4d4d8;margin:0}
+.login-options{gap:12px;flex-wrap:wrap}
+.login-options .link-button{font-size:12px;font-weight:600}
+@media (max-height:640px){
+  .auth-card{gap:10px;padding:22px 26px}
+  .auth-card .auth-icon{display:none}
+  .auth-card .security-note{margin-top:4px}
+}

@@ -5,7 +5,7 @@ mod db;
 mod http_server;
 mod servers;
 
-use auth::{AuthResponse, LoginRequest, RegisterRequest, RefreshRequest, LogoutRequest, ForgotPasswordRequest, OAuthRequest, DbPool};
+use auth::{AuthResponse, LoginRequest, RegisterRequest, RefreshRequest, LogoutRequest, ForgotPasswordRequest, DbPool};
 use db::init_db;
 use futures_util::StreamExt;
 use http_server::start_http_server;
@@ -1815,22 +1815,6 @@ async fn auth_forgot_password(
     auth::forgot_password(&pool, &request.nickname).await
 }
 
-#[tauri::command]
-async fn auth_oauth(
-    pool: State<'_, DbPool>,
-    request: OAuthRequest,
-) -> Result<AuthResponse, String> {
-    auth::oauth_login(
-        &pool,
-        &request.provider,
-        &request.code,
-        &request.code,
-        None,
-        None,
-        &request.device_fp,
-    ).await
-}
-
 /// Scan user-installed mods in the mods directory
 #[tauri::command]
 async fn scan_user_mods_cmd(game_dir: String) -> Result<UserModsManifest, String> {
@@ -2822,7 +2806,6 @@ fn main() {
             auth_logout,
             auth_me,
             auth_forgot_password,
-            auth_oauth,
             // User mods commands
             scan_user_mods_cmd,
             get_user_mods,

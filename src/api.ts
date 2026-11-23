@@ -39,12 +39,6 @@ export interface ForgotPasswordRequest {
   nickname: string;
 }
 
-export interface OAuthRequest {
-  provider: string;
-  code: string;
-  device_fp: string;
-}
-
 // Auth API functions
 export async function authLogin(request: LoginRequest): Promise<AuthResponse> {
   return invoke<AuthResponse>('auth_login', { request });
@@ -68,10 +62,6 @@ export async function authMe(accessToken: string): Promise<UserResponse> {
 
 export async function authForgotPassword(request: ForgotPasswordRequest): Promise<void> {
   return invoke('auth_forgot_password', { request });
-}
-
-export async function authOAuth(request: OAuthRequest): Promise<AuthResponse> {
-  return invoke<AuthResponse>('auth_oauth', { request });
 }
 
 // Token management

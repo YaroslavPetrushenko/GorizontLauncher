@@ -205,7 +205,7 @@ export default function App() {
             <h1>{t('heroTitle1')}<br /><em>{t('heroTitle2')}</em></h1>
             <p className="hero-copy">{t('heroCopy')}</p>
             <div className="welcome-chip"><span className="avatar">{account.uuid ? <img src={`https://mc-heads.net/avatar/${account.uuid}/36`} alt="" /> : account.username.slice(0, 1).toUpperCase()}</span><div><small>{t('welcome')}</small><strong>{account.username}</strong></div></div>
-            <div className="pack-line">{t('packVersion')}: <b>{settings.localVersion === '0.0.0' ? '—' : `v${settings.localVersion}`}</b></div>
+            <div className="pack-line">{t('packVersion')}: <b>{!settings.localVersion || settings.localVersion === '0.0.0' ? '—' : `v${settings.localVersion}`}</b></div>
             <button className="play-button" onClick={play} disabled={busy} aria-busy={busy}>
               {busy ? <Loader2 size={21} className="spin" /> : <Play size={21} fill="currentColor" />}
               {busy ? t('loading') : t('play')}<span />
