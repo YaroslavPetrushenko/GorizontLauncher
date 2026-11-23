@@ -217,7 +217,7 @@ export default function App() {
 
         {activeTab === 'mods' && (
           <section className="mods-section">
-            <UserMods t={t} gameDir={settings.gameDir} username={account.username} askPassword={moderator.ask} forgetPassword={moderator.forget} />
+            <UserMods t={t} gameDir={settings.gameDir} />
           </section>
         )}
 

@@ -504,74 +504,58 @@ fn save_user_mods_manifest(game_path: &Path, manifest: &UserModsManifest) -> Res
 
 /// Scan the mods directory for user-installed mods and update the manifest
 fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
+    recover_user_mods_backup(game_path);
     enforce_blocked_mods(game_path);
     let mods_dir = game_path.join("mods");
+    let parked_dir = game_path.join("mods-disabled");
     let mut manifest = load_user_mods_manifest(game_path)?;
-    // Approval is decided by a moderator on the server. Without a cached list (never reached the server) the
-    // previous local flag is kept so that nothing disappears just because the server is offline.
-    let moderation = load_moderation_cache();
-    let catalog_files: HashSet<String> = load_modrinth_state().installed.values().map(|i| i.filename.clone()).collect();
+    let state = load_modrinth_state();
     let pack_mods = pack_mod_filenames(game_path);
-    
-    if !mods_dir.exists() {
-        return Ok(manifest);
+
+    // "My mods" are exactly the mods the player downloaded from the extra-mods section (remembered in the
+    // Modrinth state). Mods of the modpack and files dropped into the folder by hand are not listed.
+    let mut mods: HashMap<String, UserMod> = HashMap::new();
+    for installed in state.installed.values() {
+        if pack_mods.contains(&installed.filename) { continue; }
+        let active = mods_dir.join(&installed.filename);
+        let parked = parked_dir.join(&installed.filename);
+        let (path, enabled) = if active.is_file() { (active, true) } else if parked.is_file() { (parked, false) } else { continue };
+        let id = installed.filename.strip_suffix(".jar").unwrap_or(&installed.filename).to_string();
+        let previous = manifest.mods.get(&id);
+        mods.insert(id.clone(), UserMod {
+            id,
+            filename: installed.filename.clone(),
+            hash: compute_file_sha256(&path)?,
+            enabled,
+            // Not an approval any more: every mod the player downloaded is kept across modpack updates.
+            approved: true,
+            display_name: previous.and_then(|m| m.display_name.clone()),
+            version: previous.and_then(|m| m.version.clone()).or_else(|| Some(installed.version_number.clone())),
+        });
     }
-    
-    let entries = fs::read_dir(&mods_dir).map_err(|e| format!("Failed to read mods directory: {}", e))?;
-    
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jar") {
-            let filename = entry.file_name().to_string_lossy().to_string();
-            if pack_mods.contains(&filename) { continue; }
-            // Use filename without .jar as ID
-            let id = filename.strip_suffix(".jar").unwrap_or(&filename).to_string();
-            
-            // Compute hash if not already in manifest or if file changed
-            // Always re-hash: a jar swapped under an approved name must not inherit the approval.
-            let should_update_hash = true;
-            
-            let hash = if should_update_hash {
-                compute_file_sha256(&path)?
-            } else {
-                manifest.mods.get(&id).map(|m| m.hash.clone()).unwrap_or_default()
-            };
-            
-            // Preserve existing enabled/approved state if mod already tracked
-            let (enabled, approved, display_name, version) = if let Some(existing) = manifest.mods.get(&id) {
-                (existing.enabled, existing.approved, existing.display_name.clone(), existing.version.clone())
-            } else {
-                (true, false, None, None)
-            };
-            let approved = match &moderation {
-                Some(list) => list.approved.iter().any(|h| h.eq_ignore_ascii_case(&hash)),
-                None => approved,
-            } || catalog_files.contains(&filename);
-            
-            manifest.mods.insert(id.clone(), UserMod {
-                id,
-                filename: filename.clone(),
-                hash,
-                enabled,
-                approved,
-                display_name,
-                version,
-            });
-        }
-    }
-    
-    // Remove entries for mods that no longer exist in the directory
-    let existing_ids: std::collections::HashSet<String> = fs::read_dir(&mods_dir)
-        .map_err(|e| format!("Failed to read mods directory: {}", e))?
-        .flatten()
-        .filter(|e| e.path().is_file() && e.path().extension().and_then(|s| s.to_str()) == Some("jar"))
-        .map(|e| e.file_name().to_string_lossy().strip_suffix(".jar").unwrap_or("").to_string())
-        .collect();
-    
-    manifest.mods.retain(|id, m| existing_ids.contains(id) && !pack_mods.contains(&m.filename));
-    
+    manifest.mods = mods;
     save_user_mods_manifest(game_path, &manifest)?;
     Ok(manifest)
+}
+
+fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
+    if fs::rename(src, dst).is_ok() { return Ok(()); }
+    fs::copy(src, dst)?;
+    fs::remove_file(src)
+}
+
+/// Mods left in the backup folder by an interrupted modpack update are put back, so nothing is ever lost.
+fn recover_user_mods_backup(game_path: &Path) {
+    let backup_dir = user_mods_backup_dir(game_path);
+    let mods_dir = game_path.join("mods");
+    let Ok(entries) = fs::read_dir(&backup_dir) else { return };
+    let _ = fs::create_dir_all(&mods_dir);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let dst = mods_dir.join(entry.file_name());
+        if dst.exists() { let _ = fs::remove_file(&path); } else { let _ = move_file(&path, &dst); }
+    }
 }
 
 /// Get the path to the approved user mods backup directory
@@ -581,53 +565,43 @@ fn user_mods_backup_dir(game_path: &Path) -> PathBuf {
 
 /// Backup approved user mods before modpack update
 fn backup_approved_user_mods(game_path: &Path) -> Result<Vec<UserMod>, String> {
+    // Before the pack is replaced, the mods the player downloaded are MOVED out of `mods` ...
     let manifest = scan_user_mods(game_path)?;
     let backup_dir = user_mods_backup_dir(game_path);
-    
-    // Get approved and enabled mods
-    let approved_mods: Vec<UserMod> = manifest.mods.values()
-        .filter(|m| m.approved && m.enabled)
-        .cloned()
-        .collect();
-    
-    if approved_mods.is_empty() {
+    let kept: Vec<UserMod> = manifest.mods.values().filter(|m| m.enabled).cloned().collect();
+    if kept.is_empty() {
         return Ok(vec![]);
     }
-    
     fs::create_dir_all(&backup_dir).map_err(|e| format!("Failed to create backup directory: {}", e))?;
-    
-    for mod_entry in &approved_mods {
-        let src = game_path.join("mods").join(&mod_entry.filename);
-        let dst = backup_dir.join(&mod_entry.filename);
+    for entry in &kept {
+        let src = game_path.join("mods").join(&entry.filename);
         if src.exists() {
-            fs::copy(&src, &dst).map_err(|e| format!("Failed to backup user mod {}: {}", mod_entry.filename, e))?;
+            move_file(&src, &backup_dir.join(&entry.filename)).map_err(|e| format!("Failed to set aside user mod {}: {}", entry.filename, e))?;
         }
     }
-    
-    Ok(approved_mods)
+    Ok(kept)
 }
 
-/// Restore approved user mods after modpack update
+/// ... and after the old pack is gone and the new one is unpacked, they are put back next to it.
 fn restore_approved_user_mods(game_path: &Path, approved_mods: &[UserMod]) -> Result<(), String> {
     if approved_mods.is_empty() {
         return Ok(());
     }
-    
     let backup_dir = user_mods_backup_dir(game_path);
     let mods_dir = game_path.join("mods");
     fs::create_dir_all(&mods_dir).map_err(|e| format!("Failed to create mods directory: {}", e))?;
-    
-    for mod_entry in approved_mods {
-        let src = backup_dir.join(&mod_entry.filename);
-        let dst = mods_dir.join(&mod_entry.filename);
-        if src.exists() {
-            fs::copy(&src, &dst).map_err(|e| format!("Failed to restore user mod {}: {}", mod_entry.filename, e))?;
+    for entry in approved_mods {
+        let src = backup_dir.join(&entry.filename);
+        let dst = mods_dir.join(&entry.filename);
+        if !src.exists() { continue; }
+        if dst.exists() {
+            // The new pack ships the same file: the pack's copy wins.
+            let _ = fs::remove_file(&src);
+        } else {
+            move_file(&src, &dst).map_err(|e| format!("Failed to restore user mod {}: {}", entry.filename, e))?;
         }
     }
-    
-    // Re-scan to update manifest with restored mods
     scan_user_mods(game_path)?;
-    
     Ok(())
 }
 
@@ -1966,44 +1940,36 @@ async fn get_user_mods(game_dir: String) -> Result<UserModsManifest, String> {
 #[tauri::command]
 async fn toggle_user_mod(game_dir: String, mod_id: String, enabled: bool) -> Result<UserModsManifest, String> {
     let game_path = expand_windows_path(&game_dir);
-    let mut manifest = load_user_mods_manifest(&game_path)?;
-    
-    if let Some(mod_entry) = manifest.mods.get_mut(&mod_id) {
-        mod_entry.enabled = enabled;
-        save_user_mods_manifest(&game_path, &manifest)?;
-    } else {
-        return Err(format!("Mod not found: {}", mod_id));
+    let manifest = load_user_mods_manifest(&game_path)?;
+    let entry = manifest.mods.get(&mod_id).cloned().ok_or_else(|| format!("Mod not found: {}", mod_id))?;
+    let active = game_path.join("mods").join(&entry.filename);
+    let parked_dir = game_path.join("mods-disabled");
+    let parked = parked_dir.join(&entry.filename);
+    if enabled {
+        if parked.is_file() && !active.exists() {
+            move_file(&parked, &active).map_err(|e| format!("Не удалось включить мод: {e}"))?;
+        }
+    } else if active.is_file() {
+        fs::create_dir_all(&parked_dir).map_err(|e| e.to_string())?;
+        move_file(&active, &parked).map_err(|e| format!("Не удалось отключить мод: {e}"))?;
     }
-    
-    Ok(manifest)
+    scan_user_mods(&game_path)
 }
 
-/// Toggle user mod approved state (for persistence across updates)
-#[tauri::command]
-async fn approve_user_mod(game_dir: String, mod_id: String, approved: bool) -> Result<UserModsManifest, String> {
-    // Approval belongs to the moderator and is stored on the server (see moderate_mod); a local request
-    // cannot grant it. This only re-reads the files and the server-wide list.
-    let _ = approved;
-    let _ = refresh_moderation().await;
-    let game_path = expand_windows_path(&game_dir);
-    ensure_pack_mods_list(&game_path).await;
-    let manifest = scan_user_mods(&game_path)?;
-    if !manifest.mods.contains_key(&mod_id) {
-        return Err(format!("Mod not found: {}", mod_id));
-    }
-    Ok(manifest)
-}
-
-/// Remove a user mod from tracking (but keep the file)
+/// Delete a mod the player downloaded: its file (active or parked) and its record.
 #[tauri::command]
 async fn remove_user_mod_tracking(game_dir: String, mod_id: String) -> Result<UserModsManifest, String> {
     let game_path = expand_windows_path(&game_dir);
-    let mut manifest = load_user_mods_manifest(&game_path)?;
-    
-    manifest.mods.remove(&mod_id);
-    save_user_mods_manifest(&game_path, &manifest)?;
-    
-    Ok(manifest)
+    let manifest = load_user_mods_manifest(&game_path)?;
+    let entry = manifest.mods.get(&mod_id).cloned().ok_or_else(|| format!("Mod not found: {}", mod_id))?;
+    for dir in ["mods", "mods-disabled"] {
+        let path = game_path.join(dir).join(&entry.filename);
+        if path.is_file() { fs::remove_file(&path).map_err(|e| format!("Не удалось удалить {}: {e}", entry.filename))?; }
+    }
+    let mut state = load_modrinth_state();
+    state.installed.retain(|_, installed| installed.filename != entry.filename);
+    save_modrinth_state(&state)?;
+    scan_user_mods(&game_path)
 }
 
 /// Backup approved user mods before modpack update
@@ -2305,6 +2271,7 @@ struct InstalledProject {
 struct ExtraModsState {
     installed: Vec<String>,
     blocked: Vec<String>,
+    approved: Vec<String>,
     titles: HashMap<String, String>,
 }
 
@@ -2379,7 +2346,12 @@ async fn modrinth_search(
     index: Option<String>,
     offset: Option<u32>,
     limit: Option<u32>,
+    as_moderator: Option<bool>,
 ) -> Result<ModrinthSearchResponse, String> {
+    // Everybody except the moderator only gets the mods a moderator approved for download.
+    if !as_moderator.unwrap_or(false) {
+        return modrinth_search_approved(query, game_version, loader, categories, index, offset, limit).await;
+    }
     let (mc_version, config_loader) = pack_game_version(game_version)?;
     let project_loader = loader.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or(config_loader);
     let client = modrinth_client()?;
@@ -2411,9 +2383,7 @@ async fn modrinth_search(
         .map_err(|e| format!("Modrinth вернул ошибку: {e}"))?;
     let raw: ModrinthSearchRaw = response.json().await.map_err(|e| format!("Не удалось разобрать ответ Modrinth: {e}"))?;
 
-    let state = load_modrinth_state();
     let hits: Vec<ModrinthHit> = raw.hits.into_iter()
-        .filter(|h| !state.blocked.iter().any(|b| b == &h.project_id))
         .map(|h| ModrinthHit {
             project_id: h.project_id,
             slug: h.slug,
@@ -2433,6 +2403,87 @@ async fn modrinth_search(
     Ok(ModrinthSearchResponse { hits, total_hits: raw.total_hits, offset: raw.offset, limit: raw.limit })
 }
 
+
+/// Search for players: only mods a moderator approved (and did not block), always client-only.
+async fn modrinth_search_approved(
+    query: Option<String>,
+    game_version: Option<String>,
+    loader: Option<String>,
+    categories: Option<Vec<String>>,
+    index: Option<String>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<ModrinthSearchResponse, String> {
+    let (mc_version, config_loader) = pack_game_version(game_version)?;
+    let project_loader = loader.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or(config_loader);
+    let offset = offset.unwrap_or(0) as usize;
+    let limit = limit.unwrap_or(20).clamp(1, 50) as usize;
+    let moderation = refresh_moderation().await;
+    let ids: Vec<String> = moderation.approved.iter().filter(|id| !moderation.blocked.contains(id)).cloned().collect();
+    if ids.is_empty() {
+        return Ok(ModrinthSearchResponse { hits: vec![], total_hits: 0, offset: offset as u32, limit: limit as u32 });
+    }
+    let client = modrinth_client()?;
+    let mut projects: Vec<serde_json::Value> = Vec::new();
+    for chunk in ids.chunks(40) {
+        let ids_text = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+        let batch: Vec<serde_json::Value> = client
+            .get(format!("{MODRINTH_API}/projects"))
+            .header("User-Agent", MODRINTH_UA)
+            .query(&[("ids", ids_text.as_str())])
+            .send().await
+            .map_err(|e| format!("Modrinth недоступен: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("Modrinth вернул ошибку: {e}"))?
+            .json().await
+            .map_err(|e| format!("Не удалось разобрать ответ Modrinth: {e}"))?;
+        projects.extend(batch);
+    }
+    let text = |p: &serde_json::Value, key: &str| -> String { p.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string() };
+    let list = |p: &serde_json::Value, key: &str| -> Vec<String> {
+        p.get(key).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    };
+    let query_lower = query.unwrap_or_default().trim().to_lowercase();
+    let wanted: Vec<String> = categories.unwrap_or_default().into_iter().map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()).collect();
+    let mut hits: Vec<ModrinthHit> = projects.iter()
+        .filter(|project| {
+            let p: &serde_json::Value = project;
+            let client_side = text(p, "client_side");
+            let server_side = text(p, "server_side");
+            let cats: Vec<String> = list(p, "categories").into_iter().chain(list(p, "additional_categories")).map(|c| c.to_lowercase()).collect();
+            matches!(client_side.as_str(), "required" | "optional")
+                && matches!(server_side.as_str(), "optional" | "unsupported")
+                && list(p, "game_versions").iter().any(|v| v == &mc_version)
+                && list(p, "loaders").iter().any(|l| l == &project_loader)
+                && (query_lower.is_empty() || ["title", "description", "slug"].iter().any(|k| text(p, k).to_lowercase().contains(&query_lower)))
+                && (wanted.is_empty() || wanted.iter().any(|w| cats.contains(w)))
+        })
+        .map(|project| {
+            let p: &serde_json::Value = project;
+            ModrinthHit {
+                project_id: text(p, "id"),
+                slug: text(p, "slug"),
+                title: text(p, "title"),
+                description: text(p, "description"),
+                author: String::new(),
+                icon_url: p.get("icon_url").and_then(|v| v.as_str()).map(String::from),
+                downloads: p.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
+                follows: p.get("followers").and_then(|v| v.as_u64()).unwrap_or(0),
+                categories: list(p, "categories"),
+                client_side: text(p, "client_side"),
+                server_side: text(p, "server_side"),
+                date_modified: p.get("updated").and_then(|v| v.as_str()).map(String::from),
+            }
+        })
+        .collect();
+    match index.as_deref() {
+        Some("newest") => hits.sort_by(|a, b| b.date_modified.cmp(&a.date_modified)),
+        _ => hits.sort_by(|a, b| b.downloads.cmp(&a.downloads)),
+    }
+    let total = hits.len();
+    let page: Vec<ModrinthHit> = hits.into_iter().skip(offset).take(limit).collect();
+    Ok(ModrinthSearchResponse { hits: page, total_hits: total as u32, offset: offset as u32, limit: limit as u32 })
+}
 
 /// Newest version of a project that has files for the pack's Minecraft version and loader.
 async fn modrinth_pick_version(client: &reqwest::Client, game_version: &str, loader: &str, project_id: &str) -> Result<ModrinthVersion, String> {
@@ -2480,6 +2531,7 @@ async fn modrinth_install_mod(
     game_version: Option<String>,
     loader: Option<String>,
     overwrite: Option<bool>,
+    as_moderator: Option<bool>,
 ) -> Result<String, String> {
     let overwrite = overwrite.unwrap_or(false);
     let (mc_version, config_loader) = pack_game_version(game_version)?;
@@ -2487,8 +2539,15 @@ async fn modrinth_install_mod(
     let game_path = expand_windows_path(&game_dir);
 
     let mut state = load_modrinth_state();
-    if refresh_moderation().await.blocked.iter().any(|b| b == &project_id) {
-        return Err("Этот мод заблокирован модератором и не может быть установлен".into());
+    // Players may only download what a moderator approved; blocked mods exist only for the moderator.
+    if !as_moderator.unwrap_or(false) {
+        let moderation = refresh_moderation().await;
+        if moderation.blocked.iter().any(|b| b == &project_id) {
+            return Err("Этот мод недоступен".into());
+        }
+        if !moderation.approved.iter().any(|a| a == &project_id) {
+            return Err("Этот мод ещё не одобрен модератором, скачать его пока нельзя".into());
+        }
     }
 
     let client = modrinth_client()?;
@@ -2606,7 +2665,9 @@ async fn get_extra_mods_state() -> Result<ExtraModsState, String> {
     installed.sort();
     let mut blocked = moderation.blocked.clone();
     blocked.sort();
-    Ok(ExtraModsState { installed, blocked, titles: moderation.titles.clone() })
+    let mut approved = moderation.approved.clone();
+    approved.sort();
+    Ok(ExtraModsState { installed, blocked, approved, titles: moderation.titles.clone() })
 }
 
 /// Open a link in the system browser. Only http/https are allowed.
@@ -2930,7 +2991,6 @@ fn main() {
             scan_user_mods_cmd,
             get_user_mods,
             toggle_user_mod,
-            approve_user_mod,
             remove_user_mod_tracking,
             backup_user_mods,
             restore_user_mods,
@@ -2997,5 +3057,90 @@ mod server_auth_tests {
         assert!(!facets.contains("client_side:unknown"));
         assert!(facets.contains("server_side:unsupported") && facets.contains("server_side:optional"));
         assert!(!facets.contains("server_side:required"));
+    }
+    /// The whole life of "My mods": only catalog downloads are listed, they are set aside while the pack is
+    /// replaced and put back afterwards, an interrupted update loses nothing, enable/disable/remove really act
+    /// on files, and a mod blocked by a moderator disappears. Runs against temporary folders only.
+    #[test]
+    fn my_mods_follow_the_update_flow() {
+        let root = std::env::temp_dir().join(format!("gorizont-mymods-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let data = root.join("appdata");
+        let game = root.join("game");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(game.join("mods")).unwrap();
+        let previous_appdata = env::var("LOCALAPPDATA").ok();
+        env::set_var("LOCALAPPDATA", &data);
+
+        // old pack mod, a mod downloaded from the catalog, and a file dropped in by hand
+        fs::write(game.join("mods/pack-a-1.0.jar"), b"pack a").unwrap();
+        fs::write(game.join("mods/mymap-1.0.jar"), b"my map").unwrap();
+        fs::write(game.join("mods/handmade.jar"), b"manual").unwrap();
+        save_pack_mod_list(&game, &["pack-a-1.0.jar".to_string()].into_iter().collect());
+        let mut state = ModrinthState::default();
+        state.installed.insert("MapProj1".into(), InstalledProject { filename: "mymap-1.0.jar".into(), version_number: "1.0".into() });
+        save_modrinth_state(&state).unwrap();
+
+        // 1) only the catalog download is listed: not the pack mod, not the hand-made file
+        let manifest = scan_user_mods(&game).unwrap();
+        let mut ids: Vec<String> = manifest.mods.keys().cloned().collect();
+        ids.sort();
+        assert_eq!(ids, vec!["mymap-1.0".to_string()]);
+        assert!(manifest.mods["mymap-1.0"].enabled);
+
+        // 2) the update starts: the player's mod is moved out of mods
+        let kept = backup_approved_user_mods(&game).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(!game.join("mods/mymap-1.0.jar").exists());
+        assert!(game.join("mods-user-backup/mymap-1.0.jar").exists());
+
+        // 3) the old pack is replaced by the new one
+        fs::remove_file(game.join("mods/pack-a-1.0.jar")).unwrap();
+        fs::write(game.join("mods/pack-a-2.0.jar"), b"pack a 2").unwrap();
+        save_pack_mod_list(&game, &["pack-a-2.0.jar".to_string()].into_iter().collect());
+
+        // 4) the player's mod is put back next to the new pack
+        restore_approved_user_mods(&game, &kept).unwrap();
+        assert!(game.join("mods/mymap-1.0.jar").exists());
+        assert!(!game.join("mods-user-backup/mymap-1.0.jar").exists());
+        assert!(game.join("mods/pack-a-2.0.jar").exists());
+        assert!(scan_user_mods(&game).unwrap().mods.contains_key("mymap-1.0"));
+
+        // 5) an interrupted update: the mod is stuck in the backup folder and comes back on the next scan
+        let kept = backup_approved_user_mods(&game).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(!game.join("mods/mymap-1.0.jar").exists());
+        let manifest = scan_user_mods(&game).unwrap();
+        assert!(game.join("mods/mymap-1.0.jar").exists(), "recovered after an interrupted update");
+        assert!(manifest.mods.contains_key("mymap-1.0"));
+
+        // 6) disabling moves the file out of mods, enabling brings it back
+        let game_dir = game.to_string_lossy().to_string();
+        let manifest = tauri::async_runtime::block_on(toggle_user_mod(game_dir.clone(), "mymap-1.0".into(), false)).unwrap();
+        assert!(!manifest.mods["mymap-1.0"].enabled);
+        assert!(!game.join("mods/mymap-1.0.jar").exists() && game.join("mods-disabled/mymap-1.0.jar").exists());
+        assert!(backup_approved_user_mods(&game).unwrap().is_empty(), "a disabled mod is not touched by an update");
+        let manifest = tauri::async_runtime::block_on(toggle_user_mod(game_dir.clone(), "mymap-1.0".into(), true)).unwrap();
+        assert!(manifest.mods["mymap-1.0"].enabled && game.join("mods/mymap-1.0.jar").exists());
+
+        // 7) a mod blocked by a moderator disappears from the player's game
+        save_moderation_cache(&ModerationState { blocked: vec!["MapProj1".into()], approved: vec![], titles: HashMap::new() });
+        let manifest = scan_user_mods(&game).unwrap();
+        assert!(manifest.mods.is_empty());
+        assert!(!game.join("mods/mymap-1.0.jar").exists() && game.join("mods-blocked/mymap-1.0.jar").exists());
+
+        // 8) removing a downloaded mod deletes the file and the record
+        fs::write(game.join("mods/other-1.0.jar"), b"other").unwrap();
+        let mut state = load_modrinth_state();
+        state.installed.insert("OtherPro".into(), InstalledProject { filename: "other-1.0.jar".into(), version_number: "1.0".into() });
+        save_modrinth_state(&state).unwrap();
+        assert!(scan_user_mods(&game).unwrap().mods.contains_key("other-1.0"));
+        let manifest = tauri::async_runtime::block_on(remove_user_mod_tracking(game_dir, "other-1.0".into())).unwrap();
+        assert!(manifest.mods.is_empty());
+        assert!(!game.join("mods/other-1.0.jar").exists());
+        assert!(!load_modrinth_state().installed.contains_key("OtherPro"));
+
+        match previous_appdata { Some(v) => env::set_var("LOCALAPPDATA", v), None => env::remove_var("LOCALAPPDATA") }
+        let _ = fs::remove_dir_all(&root);
     }
 }
