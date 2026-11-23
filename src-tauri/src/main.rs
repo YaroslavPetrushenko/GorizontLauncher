@@ -122,19 +122,6 @@ fn ensure_assets(target: &Path) -> Result<(), String> {
         }
     }
 
-    // Copy mods from default .minecraft if missing
-    let mods_dir = target.join("mods");
-    let mods_exist = mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
-    if !mods_exist {
-        let default_mc = env::var("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap_or_default();
-        let default_mods = default_mc.join("mods");
-        if default_mods.exists() {
-            eprintln!("[ASSETS] Copying mods from {}", default_mods.display());
-            copy_dir_all(&default_mods, &mods_dir).map_err(|e| format!("Не удалось скопировать моды: {e}"))?;
-            eprintln!("[ASSETS] Mods copied");
-        }
-    }
-
     // Copy config from default .minecraft if missing
     let config_dir = target.join("config");
     let config_exist = config_dir.exists() && config_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
@@ -397,6 +384,48 @@ fn save_pack_mod_list(game_path: &Path, names: &HashSet<String>) {
     if let Ok(text) = serde_json::to_string_pretty(&sorted) { let _ = fs::write(pack_mods_list_path(game_path), text); }
 }
 
+/// The mod files of the installed pack, recorded when the pack was installed (None while unknown).
+fn read_pack_mod_list(game_path: &Path) -> Option<HashSet<String>> {
+    let text = fs::read_to_string(pack_mods_list_path(game_path)).ok()?;
+    let list: Vec<String> = serde_json::from_str(&text).ok()?;
+    if list.is_empty() { None } else { Some(list.into_iter().collect()) }
+}
+
+/// Every mod of the installed pack is in the mods folder. This is the whole pack check: it looks only at the
+/// recorded names, so the mods a player downloaded, removed or disabled never make the pack look broken.
+/// Without a record (very old install) it falls back to "the folder is not empty".
+fn pack_mods_present(game_path: &Path) -> bool {
+    let mods_dir = game_path.join("mods");
+    match read_pack_mod_list(game_path) {
+        Some(list) => list.iter().all(|name| mods_dir.join(name).is_file()),
+        None => mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0,
+    }
+}
+
+/// A jar in `mods` that belongs neither to the pack nor to the mods the player downloaded in the "Extra mods"
+/// section is an extra (a cheat or a leftover): it is moved to `mods-removed`. Nothing is done while the pack
+/// record is unknown, so a missing record can never remove legitimate mods. Returns the names moved.
+fn quarantine_unknown_mods(game_path: &Path) -> Vec<String> {
+    let Some(pack) = read_pack_mod_list(game_path) else { return Vec::new() };
+    let downloaded: HashSet<String> = load_modrinth_state().installed.values().map(|i| i.filename.clone()).collect();
+    let mods_dir = game_path.join("mods");
+    let removed_dir = game_path.join("mods-removed");
+    let mut moved = Vec::new();
+    let Ok(entries) = fs::read_dir(&mods_dir) else { return moved };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_file() || !name.to_lowercase().ends_with(".jar") { continue; }
+        if pack.contains(&name) || downloaded.contains(&name) { continue; }
+        let _ = fs::create_dir_all(&removed_dir);
+        if move_file(&path, &removed_dir.join(&name)).is_ok() {
+            eprintln!("[MODS] extra mod moved out of the game: {name}");
+            moved.push(name);
+        }
+    }
+    moved
+}
+
 /// File names of the mods that belong to the modpack. They are not "user mods": no approval applies to them and
 /// the launcher does not list them.
 fn pack_mod_filenames(game_path: &Path) -> HashSet<String> {
@@ -506,6 +535,7 @@ fn save_user_mods_manifest(game_path: &Path, manifest: &UserModsManifest) -> Res
 fn scan_user_mods(game_path: &Path) -> Result<UserModsManifest, String> {
     recover_user_mods_backup(game_path);
     enforce_blocked_mods(game_path);
+    quarantine_unknown_mods(game_path);
     let mods_dir = game_path.join("mods");
     let parked_dir = game_path.join("mods-disabled");
     let mut manifest = load_user_mods_manifest(game_path)?;
@@ -729,62 +759,6 @@ fn compute_file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", result))
 }
 
-/// Verify all files in the modpack against the integrity manifest
-fn verify_integrity_manifest(
-    game_path: &Path,
-    manifest: &FileIntegrityManifest,
-    config: &LauncherConfig,
-) -> Result<(), String> {
-    for (rel_path, expected_hash) in &manifest.files {
-        let file_path = game_path.join(rel_path);
-        if !file_path.exists() {
-            // A mod the player disabled or removed on purpose is not corruption: skip it, do not reinstall the pack.
-            if rel_path.replace('\\', "/").starts_with("mods/") { continue; }
-            return Err(format!("File missing: {}", rel_path));
-        }
-        let actual_hash = compute_file_sha256(&file_path)?;
-        if actual_hash.to_lowercase() != expected_hash.to_lowercase() {
-            return Err(format!("File corrupted/modified: {} (expected {}, got {})", rel_path, expected_hash, actual_hash));
-        }
-    }
-    // Also verify pack_version matches
-    let marker = game_path.join(".gorizont-installed.json");
-    if let Ok(text) = fs::read_to_string(&marker) {
-        if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
-            if installed.pack_version != manifest.pack_version {
-                return Err(format!("Pack version mismatch: marker says {}, integrity manifest says {}", installed.pack_version, manifest.pack_version));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Download and parse the file integrity manifest from GitHub
-async fn download_integrity_manifest(config: &LauncherConfig) -> Result<Option<FileIntegrityManifest>, String> {
-    let Ok(releases_text) = fetch_releases_text(config).await else { return Ok(None) };
-    let Ok(releases) = serde_json::from_str::<Vec<Release>>(&releases_text) else { return Ok(None) };
-    
-    for release in releases {
-        if let Some(asset) = release.assets.iter().find(|a| a.name == "file-manifest.json") {
-            let url = asset.browser_download_url.clone();
-            let client = reqwest::Client::new();
-            let response = match client.get(&url).header("User-Agent", "GorizontLauncher/1.0").send().await {
-                Ok(r) => r,
-                Err(_) => return Ok(None),
-            };
-            let response = match response.error_for_status() {
-                Ok(r) => r,
-                Err(_) => return Ok(None),
-            };
-            let manifest: FileIntegrityManifest = match response.json().await {
-                Ok(m) => m,
-                Err(_) => return Ok(None),
-            };
-            return Ok(Some(manifest));
-        }
-    }
-    Ok(None)
-}
 
 #[derive(Clone, Serialize)] struct DownloadProgress { downloaded: u64, total: Option<u64>, percent: f32, stage: String }
 #[derive(Deserialize)] struct Release { tag_name: String, #[serde(default)] draft: bool, assets: Vec<Asset> }
@@ -885,11 +859,6 @@ async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: S
     }
     
     fs::write(target.join(".gorizont-installed.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    
-    // Download and save integrity manifest for future verification
-    if let Some(integrity_manifest) = download_integrity_manifest(&config).await? {
-        fs::write(target.join(".gorizont-integrity.json"), serde_json::to_vec_pretty(&integrity_manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    }
     
     emit_progress(&app, "Готово", 1, Some(1)); Ok(())
 }
@@ -996,8 +965,8 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     let json_exists = profile_dir.join(format!("{}.json", version_id)).exists();
     let libs_dir = target.join("libraries");
     let libs_exist = libs_dir.exists() && libs_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
-    let mods_dir = target.join("mods");
-    let mods_exist = mods_dir.exists() && mods_dir.read_dir().map(|d| d.count()).unwrap_or(0) > 0;
+    ensure_pack_mods_list(&target).await;
+    let mods_exist = pack_mods_present(&target);
     
     let mut force_update = false;
     // FIRST: Check if already installed with valid marker and correct version folder
@@ -1014,24 +983,9 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                             if let Err(e) = &other { log(&format!("pack version check failed: {e}")); }
                             
                             if jar_exists && json_exists && libs_exist && mods_exist {
-                                // Verify file integrity against GitHub manifest
-                                emit("Проверка целостности файлов...", 0, None);
-                                log("Verifying file integrity against GitHub manifest...");
-                                if let Some(integrity_manifest) = download_integrity_manifest(&effective_config).await? {
-                                    if let Err(e) = verify_integrity_manifest(&target, &integrity_manifest, &effective_config) {
-                                        log(&format!("Integrity check FAILED: {}", e));
-                                        emit("Файлы изменены, переустановка...", 0, None);
-                                        force_update = true;
-                                    } else {
-                                        log("Integrity check PASSED");
-                                        log("jar, json, libraries and mods exist and pack is up to date");
-                                        return Ok(installed.pack_version);
-                                    }
-                                } else {
-                                    log("No integrity manifest available on GitHub, skipping integrity check");
-                                    log("jar, json, libraries and mods exist and pack is up to date");
-                                    return Ok(installed.pack_version);
-                                }
+                                // No hash checks: the pack is considered intact when its recorded mods are all there.
+                                log("jar, json, libraries and all pack mods are present: the pack is up to date");
+                                return Ok(installed.pack_version);
                             } else {
                                 log(&format!("Missing files: jar={}, json={}, libs={}, mods={} - forcing update", jar_exists, json_exists, libs_exist, mods_exist));
                                 force_update = true;
@@ -1220,39 +1174,17 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
                 let installed_version = manifest.pack_version.clone();
                 fs::write(target.join(".gorizont-installed.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
                 
-                // Download and save integrity manifest for future verification
-                if let Some(integrity_manifest) = download_integrity_manifest(&effective_config).await? {
-                    fs::write(target.join(".gorizont-integrity.json"), serde_json::to_vec_pretty(&integrity_manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                }
-                
                 emit("Готово", 1, Some(1));
                 log(&format!("Local modpack installed, version={}", installed_version));
                 return Ok(installed_version);
             } else {
-                log("Local modpack already installed, verifying integrity...");
-                // Verify integrity for already installed local modpack
-                if let Some(integrity_manifest) = download_integrity_manifest(&effective_config).await? {
-                    if let Err(e) = verify_integrity_manifest(&target, &integrity_manifest, &effective_config) {
-                        log(&format!("Integrity check FAILED for local modpack: {}", e));
-                        force_update = true;
-                    } else {
-                        log("Integrity check PASSED for local modpack");
-                        if let Ok(text) = fs::read_to_string(&marker) {
-                            if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
-                                return Ok(installed.pack_version);
-                            }
-                        }
-                        return Ok("local".to_string());
+                log("Local modpack already installed");
+                if let Ok(text) = fs::read_to_string(&marker) {
+                    if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
+                        return Ok(installed.pack_version);
                     }
-                } else {
-                    log("No integrity manifest available on GitHub, skipping integrity check");
-                    if let Ok(text) = fs::read_to_string(&marker) {
-                        if let Ok(installed) = serde_json::from_str::<PackManifest>(&text) {
-                            return Ok(installed.pack_version);
-                        }
-                    }
-                    return Ok("local".to_string());
                 }
+                return Ok("local".to_string());
             }
         }
     }
@@ -1631,18 +1563,9 @@ async fn prepare_game_files(app: AppHandle, game_dir: String, version_override: 
     let version_id = loader_version_id(&loader);
     if let Err(e) = ensure_assets(&game_path) { eprintln!("[PREPARE] ensure_assets failed: {e}"); }
 
-    // Verify file integrity before launching
-    let marker = game_path.join(".gorizont-installed.json");
-    if marker.exists() {
-        if let Some(integrity_manifest) = download_integrity_manifest(&effective_config).await? {
-            if let Err(e) = verify_integrity_manifest(&game_path, &integrity_manifest, &effective_config) {
-                eprintln!("[PREPARE] Integrity check FAILED: {}", e);
-                return Err(format!("Файлы игры изменены или повреждены: {}. Требуется переустановка.", e));
-            } else {
-                eprintln!("[PREPARE] Integrity check PASSED");
-            }
-        }
-    }
+    // Extras (neither pack mods nor the player's downloads) are removed before the game starts.
+    ensure_pack_mods_list(&game_path).await;
+    quarantine_unknown_mods(&game_path);
 
     if !version_id.is_empty() { ensure_loader(&app, &game_path, &loader).await?; }
     ensure_game_files(&app, &game_path, &version_id).await
@@ -1663,18 +1586,8 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     eprintln!("[LAUNCH] jar path: {:?}, exists={}", jar, jar.exists());
     if !jar.exists() { return Err(format!("Файл Minecraft не найден: {}. Сначала добавьте modpack.zip с клиентом или укажите правильную папку игры.", jar.display())); }
 
-    // Verify file integrity before launching
-    let marker = game_path.join(".gorizont-installed.json");
-    if marker.exists() {
-        if let Some(integrity_manifest) = download_integrity_manifest(&effective_config).await? {
-            if let Err(e) = verify_integrity_manifest(&game_path, &integrity_manifest, &effective_config) {
-                eprintln!("[LAUNCH] Integrity check FAILED: {}", e);
-                return Err(format!("Файлы игры изменены или повреждены: {}. Требуется переустановка через лаунчер.", e));
-            } else {
-                eprintln!("[LAUNCH] Integrity check PASSED");
-            }
-        }
-    }
+    // A mod dropped in after the preparation is removed as well.
+    quarantine_unknown_mods(&game_path);
 
     // --- Java detection: version + architecture ---
     let java = match java_path.filter(|p| !p.trim().is_empty()) {
@@ -2971,11 +2884,15 @@ mod server_auth_tests {
         assert!(facets.contains("server_side:unsupported") && facets.contains("server_side:optional"));
         assert!(!facets.contains("server_side:required"));
     }
+    /// Tests that point LOCALAPPDATA at a temporary folder must not run at the same time.
+    static APPDATA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The whole life of "My mods": only catalog downloads are listed, they are set aside while the pack is
     /// replaced and put back afterwards, an interrupted update loses nothing, enable/disable/remove really act
     /// on files, and a mod blocked by a moderator disappears. Runs against temporary folders only.
     #[test]
     fn my_mods_follow_the_update_flow() {
+        let _guard = APPDATA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("gorizont-mymods-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let data = root.join("appdata");
@@ -3067,5 +2984,63 @@ mod server_auth_tests {
         let ids: Vec<&str> = visible.iter().map(|h| h.project_id.as_str()).collect();
         assert_eq!(ids, vec!["good", "also-good"]);
         assert_eq!(hide_blocked(vec![hit("a")], &[]).len(), 1);
+    }
+    /// The pack check looks only at the recorded pack mods: removing the mods a player downloaded never makes
+    /// the pack look broken (which used to trigger a full re-download), and extras are moved out of the game.
+    #[test]
+    fn pack_check_ignores_player_mods_and_removes_extras() {
+        let _guard = APPDATA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("gorizont-packcheck-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let data = root.join("appdata");
+        let game = root.join("game");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(game.join("mods")).unwrap();
+        let previous_appdata = env::var("LOCALAPPDATA").ok();
+        env::set_var("LOCALAPPDATA", &data);
+
+        // no record yet: the fallback only wants a non-empty folder, and nothing may be removed
+        assert!(!pack_mods_present(&game));
+        fs::write(game.join("mods/mystery.jar"), b"?").unwrap();
+        assert!(pack_mods_present(&game));
+        assert!(quarantine_unknown_mods(&game).is_empty(), "unknown pack record: never remove anything");
+        assert!(game.join("mods/mystery.jar").exists());
+        fs::remove_file(game.join("mods/mystery.jar")).unwrap();
+
+        // the record written at install time
+        save_pack_mod_list(&game, &["a.jar".to_string(), "b.jar".to_string()].into_iter().collect());
+        fs::write(game.join("mods/a.jar"), b"a").unwrap();
+        fs::write(game.join("mods/b.jar"), b"b").unwrap();
+        assert!(pack_mods_present(&game));
+
+        // the player downloaded a mod and then removed it: the pack is still fine
+        let mut state = ModrinthState::default();
+        state.installed.insert("MyMod001".into(), InstalledProject { filename: "mine.jar".into(), version_number: "1".into() });
+        save_modrinth_state(&state).unwrap();
+        fs::write(game.join("mods/mine.jar"), b"mine").unwrap();
+        assert!(pack_mods_present(&game));
+        fs::remove_file(game.join("mods/mine.jar")).unwrap();
+        assert!(pack_mods_present(&game), "deleting a downloaded mod must not look like a broken pack");
+
+        // a pack mod that really disappeared is detected
+        fs::remove_file(game.join("mods/b.jar")).unwrap();
+        assert!(!pack_mods_present(&game));
+        fs::write(game.join("mods/b.jar"), b"b").unwrap();
+
+        // extras: a cheat and a leftover are moved out, pack mods, downloads and non-jar files stay
+        fs::write(game.join("mods/mine.jar"), b"mine").unwrap();
+        fs::write(game.join("mods/killaura.jar"), b"cheat").unwrap();
+        fs::write(game.join("mods/old-version.JAR"), b"old").unwrap();
+        fs::write(game.join("mods/readme.txt"), b"text").unwrap();
+        let mut moved = quarantine_unknown_mods(&game);
+        moved.sort();
+        assert_eq!(moved, vec!["killaura.jar".to_string(), "old-version.JAR".to_string()]);
+        assert!(game.join("mods/a.jar").exists() && game.join("mods/b.jar").exists());
+        assert!(game.join("mods/mine.jar").exists() && game.join("mods/readme.txt").exists());
+        assert!(!game.join("mods/killaura.jar").exists() && game.join("mods-removed/killaura.jar").exists());
+        assert!(quarantine_unknown_mods(&game).is_empty(), "second run finds nothing");
+
+        match previous_appdata { Some(v) => env::set_var("LOCALAPPDATA", v), None => env::remove_var("LOCALAPPDATA") }
+        let _ = fs::remove_dir_all(&root);
     }
 }
