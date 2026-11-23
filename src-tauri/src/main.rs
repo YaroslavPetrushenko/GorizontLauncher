@@ -2359,21 +2359,13 @@ fn modrinth_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Не удалось создать HTTP-клиент: {e}"))
 }
 
-/// Facets restrict the search to client mods for this pack (Minecraft version + loader).
+/// Facets restrict the search to mods for this pack: the Minecraft version and the loader (NeoForge) only.
+/// Whether a mod is for the client or the server is left to the players.
 fn modrinth_facets(game_version: &str, loader: &str, categories: &[String]) -> serde_json::Value {
     let mut facets: Vec<Vec<String>> = vec![
         vec!["project_type:mod".to_string()],
         vec![format!("versions:{game_version}")],
         vec![format!("categories:{loader}")],
-        // Client mods only: they must work on the client and must not need to be on the server.
-        vec![
-            "client_side:required".to_string(),
-            "client_side:optional".to_string(),
-        ],
-        vec![
-            "server_side:unsupported".to_string(),
-            "server_side:optional".to_string(),
-        ],
     ];
     let cats: Vec<String> = categories.iter()
         .map(|c| c.trim().to_string())
@@ -2395,7 +2387,7 @@ fn pack_game_version(game_version: Option<String>) -> Result<(String, String), S
     Ok((version, config.loader_type))
 }
 
-/// Search Modrinth for client mods matching this pack.
+/// Search Modrinth for mods matching this pack (Minecraft version + NeoForge).
 /// Blocked projects are filtered out on the backend, so the UI never sees them.
 #[tauri::command]
 async fn modrinth_search(
@@ -2499,7 +2491,10 @@ async fn modrinth_fitting_versions(client: &reqwest::Client, game_version: &str,
         .map_err(|e| format!("Версии мода недоступны: {e}"))?
         .json().await
         .map_err(|e| format!("Не удалось разобрать версии мода: {e}"))?;
-    versions.retain(|v| v.files.iter().any(|f| f.filename.to_lowercase().ends_with(".jar")));
+    // Only versions made for exactly this Minecraft version and loader are ever offered or installed.
+    versions.retain(|v| v.files.iter().any(|f| f.filename.to_lowercase().ends_with(".jar"))
+        && v.game_versions.iter().any(|g| g == game_version)
+        && v.loaders.iter().any(|l| l.eq_ignore_ascii_case(loader)));
     versions.sort_by(|a, b| b.date_published.cmp(&a.date_published));
     Ok(versions)
 }
@@ -2591,11 +2586,12 @@ async fn modrinth_install_mod(
         return Err("Этот мод недоступен".into());
     }
 
+    ensure_pack_mods_list(&game_path).await;
     if pack_project_ids(&game_path).await.contains(&project_id) {
         return Err("Этот мод уже входит в сборку, скачивать его не нужно".into());
     }
     let client = modrinth_client()?;
-    // Whatever the search showed, only client mods may be installed (checked against Modrinth itself).
+    // Name, description and icon for the card.
     let project: serde_json::Value = client
         .get(format!("{MODRINTH_API}/project/{project_id}"))
         .header("User-Agent", MODRINTH_UA)
@@ -2605,11 +2601,6 @@ async fn modrinth_install_mod(
         .map_err(|e| format!("Сведения о моде недоступны: {e}"))?
         .json().await
         .map_err(|e| format!("Не удалось разобрать сведения о моде: {e}"))?;
-    let client_side = project.get("client_side").and_then(|v| v.as_str()).unwrap_or("");
-    let server_side = project.get("server_side").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(client_side, "required" | "optional") || !matches!(server_side, "optional" | "unsupported") {
-        return Err("Можно скачивать только клиентские моды: этот мод нужен ещё и на сервере или не работает на клиенте".into());
-    }
     // One version of a mod at a time: another one is installed only as an explicit replacement.
     let previous = state.installed.get(&project_id).cloned();
     if previous.is_some() && !replace.unwrap_or(false) {
@@ -2746,7 +2737,15 @@ async fn get_extra_mods_state(game_dir: Option<String>) -> Result<ExtraModsState
     let mut blocked = moderation.blocked.clone();
     blocked.sort();
     let mut pack: Vec<String> = match game_dir {
-        Some(dir) => pack_project_ids(&expand_windows_path(&dir)).await.into_iter().collect(),
+        Some(dir) => {
+            let game_path = expand_windows_path(&dir);
+            // An install without the recorded list of pack mods gets it first, otherwise nothing can be recognised.
+            ensure_pack_mods_list(&game_path).await;
+            // A block made a moment ago takes effect on the installed mods at once.
+            enforce_blocked_mods(&game_path);
+            let _ = scan_user_mods(&game_path);
+            pack_project_ids(&game_path).await.into_iter().collect()
+        }
         None => Vec::new(),
     };
     pack.sort();
@@ -3015,12 +3014,6 @@ async fn modrinth_projects(client: &reqwest::Client, ids: &[String]) -> Result<H
         .collect())
 }
 
-fn is_client_only_project(project: &serde_json::Value) -> bool {
-    let client_side = project.get("client_side").and_then(|v| v.as_str()).unwrap_or("");
-    let server_side = project.get("server_side").and_then(|v| v.as_str()).unwrap_or("");
-    matches!(client_side, "required" | "optional") && matches!(server_side, "optional" | "unsupported")
-}
-
 /// A mod the player put into `mods` by hand is looked up on Modrinth by the hash of the file. When it is a known
 /// client mod for this pack that is not blocked and whose project is not installed yet, it joins "My mods".
 /// Everything else stays an extra and is removed as usual. Also fills in names and icons of older records.
@@ -3072,7 +3065,7 @@ async fn adopt_manual_mods(game_path: &Path) {
         let Some(filename) = by_hash.get(hash) else { continue };
         let Some(project) = projects.get(&version.project_id) else { continue };
         let fits = version.game_versions.iter().any(|v| v == &mc_version) && version.loaders.iter().any(|l| l.eq_ignore_ascii_case(&loader));
-        if !fits || !is_client_only_project(project) || blocked.contains(&version.project_id) || state.installed.contains_key(&version.project_id) {
+        if !fits || blocked.contains(&version.project_id) || state.installed.contains_key(&version.project_id) {
             eprintln!("[MODS] hand-placed {filename} is not accepted (fits={fits}, project {})", version.project_id);
             continue;
         }
@@ -3273,13 +3266,12 @@ mod server_auth_tests {
     }
 
     #[test]
-    fn client_only_facets_exclude_server_mods() {
+    fn search_is_limited_to_the_pack_version_and_neoforge_only() {
         let facets = modrinth_facets("1.21.1", "neoforge", &[]).to_string();
-        assert!(facets.contains("client_side:required") && facets.contains("client_side:optional"));
-        assert!(!facets.contains("client_side:unknown"));
-        assert!(facets.contains("server_side:unsupported") && facets.contains("server_side:optional"));
-        assert!(!facets.contains("server_side:required"));
+        assert!(facets.contains("versions:1.21.1") && facets.contains("categories:neoforge"));
+        assert!(!facets.contains("client_side") && !facets.contains("server_side"), "client/server is up to the players");
     }
+
     /// Tests that point LOCALAPPDATA at a temporary folder must not run at the same time.
     static APPDATA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -3530,7 +3522,6 @@ mod server_auth_tests {
             assert_eq!(found.project_id, "AANobbMI");
             assert_eq!(found.version_number, older.version_number);
             let projects = modrinth_projects(&client, &["AANobbMI".to_string()]).await.unwrap();
-            assert!(is_client_only_project(&projects["AANobbMI"]));
             assert!(!installed_project(&projects["AANobbMI"], "x.jar", "1", true).title.is_empty());
         });
     }

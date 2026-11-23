@@ -209,11 +209,8 @@ public final class AuthHttpServer {
             respond(exchange, 405, "{\"error\":\"method not allowed\"}");
             return;
         }
-        String ip = remoteIp(exchange);
-        if (!allowRequest(ip)) {
-            respond(exchange, 429, "{\"error\":\"rate limited\"}");
-            return;
-        }
+        // No speed limit here: players refresh the lists often so that a block shows up at once. The request is
+        // signed and the answer is a small cached list, so nothing is gained by throttling it.
         if (!verifySignature(exchange, "")) {
             respond(exchange, 401, "{\"error\":\"invalid signature\"}");
             return;
@@ -227,7 +224,7 @@ public final class AuthHttpServer {
      * shows the controls only to moderators, but this check is the real protection.
      */
     private void handleModerate(HttpExchange exchange) throws IOException {
-        withSignedJson(exchange, (body, ip) -> {
+        withSignedJson(exchange, false, (body, ip) -> {
             JsonObject reply = new JsonObject();
             String nickname = stringField(body, "nickname");
             String password = stringField(body, "password");
@@ -273,13 +270,18 @@ public final class AuthHttpServer {
     }
 
     private void withSignedJson(HttpExchange exchange, SignedHandler handler) throws IOException {
+        withSignedJson(exchange, true, handler);
+    }
+
+    /** @param limited whether the per-IP request limit applies (moderation is not limited: blocking must be instant) */
+    private void withSignedJson(HttpExchange exchange, boolean limited, SignedHandler handler) throws IOException {
         try {
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
                 respond(exchange, 405, "{\"status\":\"error\",\"error\":\"method not allowed\"}");
                 return;
             }
             String ip = remoteIp(exchange);
-            if (!allowRequest(ip)) {
+            if (limited && !allowRequest(ip)) {
                 respond(exchange, 200, "{\"status\":\"error\",\"error\":\"Слишком много попыток, попробуйте позже\"}");
                 return;
             }

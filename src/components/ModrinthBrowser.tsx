@@ -125,6 +125,14 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
 
   useEffect(() => { loadState(); }, [loadState]);
 
+  // Blocks change in real time: the lists are re-read every few seconds and when the window gets focus again.
+  useEffect(() => {
+    const timer = window.setInterval(() => { loadState(); }, 8000);
+    const onFocus = () => { loadState(); };
+    window.addEventListener('focus', onFocus);
+    return () => { window.clearInterval(timer); window.removeEventListener('focus', onFocus); };
+  }, [loadState]);
+
   const search = useCallback(async (offset: number, append: boolean) => {
     if (append) setLoadingMore(true); else setLoading(true);
     setError('');
@@ -199,6 +207,8 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
   // The moderator can download a blocked mod straight from the blocked list.
   const installById = (projectId: string) => setPicking({ projectId, title: titles[projectId] || projectId });
 
+  // A player never sees a blocked mod, also one that was blocked after the search was made.
+  const visibleHits = useMemo(() => (moderator ? hits : hits.filter(hit => !blocked.has(hit.projectId))), [hits, blocked, moderator]);
   const blockedCount = blocked.size;
   const visibleBlocked = useMemo(() => Array.from(blocked), [blocked]);
   const canLoadMore = hits.length < total;
@@ -212,8 +222,8 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         </div>
         <a
           className="mr-external"
-          href="https://modrinth.com/discover/mods?v=1.21.1&g=categories:neoforge&e=client"
-          onClick={event => { event.preventDefault(); invoke('open_external_url', { url: 'https://modrinth.com/discover/mods?v=1.21.1&g=categories:neoforge&e=client' }).catch(() => undefined); }}
+          href="https://modrinth.com/discover/mods?v=1.21.1&g=categories:neoforge"
+          onClick={event => { event.preventDefault(); invoke('open_external_url', { url: 'https://modrinth.com/discover/mods?v=1.21.1&g=categories:neoforge' }).catch(() => undefined); }}
         >
           {t('mrOpenModrinth')}
         </a>
@@ -285,9 +295,9 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         </div>
       )}
 
-      {hits.length > 0 && (
+      {visibleHits.length > 0 && (
         <div className="mr-grid">
-          {hits.map(hit => {
+          {visibleHits.map(hit => {
             const isBusy = busyId === hit.projectId;
             const isInstalled = installed.has(hit.projectId);
             const inPack = pack.has(hit.projectId);

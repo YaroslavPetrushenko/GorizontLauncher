@@ -84,6 +84,12 @@ export default function UserMods({ t, gameDir, gameVersion, loader }: Props) {
     }
   };
 
+  // A mod blocked while the section is open disappears from the list (the launcher moves it out of the game).
+  useEffect(() => {
+    const timer = window.setInterval(() => { invoke('get_extra_mods_state', { gameDir }).then(() => invoke<UserModsManifest>('get_user_mods', { gameDir })).then(manifest => setMods(sorted(manifest))).catch(() => undefined); }, 10000);
+    return () => window.clearInterval(timer);
+  }, [gameDir]);
+
   // Opening the section also checks the mods folder: a mod put there by hand is recognised on Modrinth.
   useEffect(() => {
     loadMods().then(() => scanMods());
