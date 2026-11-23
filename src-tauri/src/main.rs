@@ -1712,6 +1712,104 @@ async fn lookup_mojang_profile(username: String) -> Result<Option<MojangProfile>
     Ok(match (value.get("id").and_then(|v| v.as_str()), value.get("name").and_then(|v| v.as_str())) { (Some(id), Some(name)) => Some(MojangProfile { id: id.into(), name: name.into() }), _ => None })
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Player skin for the launcher header: fetched from Mojang once, validated, cached on disk.
+// ---------------------------------------------------------------------------------------------------------------------
+
+const SKIN_TTL_SECS: u64 = 24 * 3600;
+const SKIN_NEGATIVE_TTL_SECS: u64 = 6 * 3600;
+const SKIN_MAX_BYTES: usize = 200 * 1024;
+
+fn valid_player_name(name: &str) -> bool {
+    (3..=16).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// URL of the skin in a session-server profile. Only Mojang's own texture host is accepted, so a hostile
+/// answer cannot make the launcher download from somewhere else.
+fn skin_url_from_profile(profile: &serde_json::Value) -> Option<String> {
+    use base64::Engine;
+    let properties = profile.get("properties")?.as_array()?;
+    let value = properties.iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("textures"))?
+        .get("value")?.as_str()?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
+    let textures: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let url = textures.get("textures")?.get("SKIN")?.get("url")?.as_str()?;
+    // Mojang writes these addresses with plain "http://". Only its own texture host is accepted, the id must be a
+    // plain token (no path tricks), and the download always goes over https.
+    let id = url.strip_prefix("https://textures.minecraft.net/texture/").or_else(|| url.strip_prefix("http://textures.minecraft.net/texture/"))?;
+    if id.is_empty() || id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric()) { return None; }
+    Some(format!("https://textures.minecraft.net/texture/{id}"))
+}
+
+/// A usable skin: a small PNG that is 64x64 or 64x32.
+fn is_skin_png(bytes: &[u8]) -> bool {
+    if bytes.len() < 33 || bytes.len() > SKIN_MAX_BYTES { return false; }
+    if bytes[..8] != [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] || &bytes[12..16] != b"IHDR" { return false; }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    width == 64 && (height == 64 || height == 32)
+}
+
+fn skin_data_url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Downloads the skin of a premium nickname. Ok(None): no such profile or it has no custom skin.
+async fn fetch_player_skin(name: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(profile) = lookup_mojang_profile(name.to_string()).await? else { return Ok(None) };
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
+    let response = client.get(format!("https://sessionserver.mojang.com/session/minecraft/profile/{}", profile.id))
+        .header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT || response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
+    let value: serde_json::Value = response.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    let Some(url) = skin_url_from_profile(&value) else { return Ok(None) };
+    let bytes = client.get(&url).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?.bytes().await.map_err(|e| e.to_string())?;
+    if !is_skin_png(&bytes) { return Err("Mojang вернул не скин (неверный формат)".into()); }
+    Ok(Some(bytes.to_vec()))
+}
+
+/// The player's skin as a PNG data URL, or None when the nickname has no Mojang skin (cracked nicknames).
+/// Cached on disk for a day, so the header works offline and Mojang is not asked on every start. If Mojang cannot be
+/// reached, the last cached skin is used, however old.
+#[tauri::command]
+async fn get_player_skin(username: String) -> Result<Option<String>, String> {
+    let name = username.trim().to_string();
+    if !valid_player_name(&name) { return Ok(None); }
+    let key = name.to_lowercase();
+    let dir = launcher_data_dir()?.join("skins");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let png = dir.join(format!("{key}.png"));
+    let none = dir.join(format!("{key}.none"));
+    let age = |path: &Path| fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs());
+    let cached = || fs::read(&png).ok().filter(|bytes| is_skin_png(bytes));
+
+    if let (Some(bytes), Some(seconds)) = (cached(), age(&png)) {
+        if seconds < SKIN_TTL_SECS { return Ok(Some(skin_data_url(&bytes))); }
+    }
+    if let Some(seconds) = age(&none) {
+        if seconds < SKIN_NEGATIVE_TTL_SECS && !png.exists() { return Ok(None); }
+    }
+    match fetch_player_skin(&name).await {
+        Ok(Some(bytes)) => {
+            let _ = fs::write(&png, &bytes);
+            let _ = fs::remove_file(&none);
+            Ok(Some(skin_data_url(&bytes)))
+        }
+        Ok(None) => {
+            let _ = fs::write(&none, b"");
+            let _ = fs::remove_file(&png);
+            Ok(None)
+        }
+        Err(e) => {
+            eprintln!("[SKIN] could not refresh the skin of {name}: {e}");
+            Ok(cached().map(|bytes| skin_data_url(&bytes)))
+        }
+    }
+}
+
 #[tauri::command]
 async fn link_ip_to_account(username: String) -> Result<(), String> {
     let url = webhook_url();
@@ -2793,6 +2891,7 @@ fn main() {
             get_system_memory,
             prepare_game_files,
             lookup_mojang_profile,
+            get_player_skin,
             download_and_extract_modpack,
             check_and_update_modpack,
             check_launcher_update,
@@ -3048,5 +3147,64 @@ mod server_auth_tests {
         env::set_var("GORIZONT_HMAC_SECRET", "some-key");
         assert!(require_server_key().is_ok());
         match previous { Some(v) => env::set_var("GORIZONT_HMAC_SECRET", v), None => env::remove_var("GORIZONT_HMAC_SECRET") }
+    }
+    fn tiny_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes
+    }
+
+    #[test]
+    fn skin_validation_accepts_only_real_skins_from_mojang() {
+        use base64::Engine;
+        assert!(is_skin_png(&tiny_png(64, 64)) && is_skin_png(&tiny_png(64, 32)));
+        assert!(!is_skin_png(&tiny_png(128, 128)) && !is_skin_png(&tiny_png(64, 16)), "wrong size");
+        assert!(!is_skin_png(b"<html>not a png at all, but long enough to pass the length check</html>"));
+        assert!(!is_skin_png(&[0u8; 300_000]), "too big");
+
+        let profile = |url: &str| {
+            let textures = serde_json::json!({ "textures": { "SKIN": { "url": url } } }).to_string();
+            let value = base64::engine::general_purpose::STANDARD.encode(textures);
+            serde_json::json!({ "properties": [ { "name": "textures", "value": value } ] })
+        };
+        assert_eq!(skin_url_from_profile(&profile("https://textures.minecraft.net/texture/abc123")), Some("https://textures.minecraft.net/texture/abc123".to_string()));
+        assert_eq!(skin_url_from_profile(&profile("https://evil.example/texture/abc")), None, "foreign host");
+        assert_eq!(skin_url_from_profile(&profile("http://textures.minecraft.net/texture/abc123")), Some("https://textures.minecraft.net/texture/abc123".to_string()), "Mojang uses http, we download over https");
+        assert_eq!(skin_url_from_profile(&profile("https://textures.minecraft.net/texture/abc/../x")), None, "path tricks");
+        assert_eq!(skin_url_from_profile(&profile("https://textures.minecraft.net.evil.example/texture/abc")), None, "look-alike host");
+        assert_eq!(skin_url_from_profile(&profile("https://textures.minecraft.net/texture/")), None, "empty id");
+        assert_eq!(skin_url_from_profile(&serde_json::json!({ "properties": [] })), None);
+        assert_eq!(skin_url_from_profile(&serde_json::json!({})), None);
+
+        assert!(valid_player_name("Steve_1") && !valid_player_name("ab") && !valid_player_name("../etc") && !valid_player_name("a b c"));
+        assert!(skin_data_url(&tiny_png(64, 64)).starts_with("data:image/png;base64,"));
+    }
+
+    /// Network test against the real Mojang services, with the cache in a temporary folder.
+    #[test]
+    #[ignore]
+    fn fetches_and_caches_a_real_skin() {
+        let _guard = APPDATA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("gorizont-skin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let previous = env::var("LOCALAPPDATA").ok();
+        env::set_var("LOCALAPPDATA", &root);
+
+        let first = tauri::async_runtime::block_on(get_player_skin("Notch".into())).unwrap().expect("Notch has a skin");
+        assert!(first.starts_with("data:image/png;base64,"));
+        assert!(root.join("GorizontLauncher/skins/notch.png").exists(), "skin cached on disk");
+        // the second call is served from the cache (same bytes)
+        let second = tauri::async_runtime::block_on(get_player_skin("notch".into())).unwrap().expect("cached skin");
+        assert_eq!(first, second);
+        // a nickname nobody owns: no skin, remembered as such
+        let missing = tauri::async_runtime::block_on(get_player_skin("Zq9_NoSuchPlayer_x".into())).unwrap();
+        assert!(missing.is_none());
+
+        match previous { Some(v) => env::set_var("LOCALAPPDATA", v), None => env::remove_var("LOCALAPPDATA") }
+        let _ = fs::remove_dir_all(&root);
     }
 }

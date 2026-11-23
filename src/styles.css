@@ -276,3 +276,5 @@ footer{height:44px;display:flex;align-items:center;justify-content:space-between
   .auth-card .auth-icon{display:none}
   .auth-card .security-note{margin-top:4px}
 }
+.avatar-head{image-rendering:pixelated;image-rendering:crisp-edges;object-fit:cover}
+.avatar{flex:0 0 36px;aspect-ratio:1}
