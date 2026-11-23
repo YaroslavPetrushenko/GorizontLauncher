@@ -9,7 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  # The release is created once, before the system builds start, so they do not race to create it.
+  # The release is created once as a draft, before the system builds start, so they do not race to create it.
+  # A published release is immutable, so it is published only after every installer is attached.
   release:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -20,7 +21,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Gorizont Launcher $TAG" --generate-notes
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Gorizont Launcher $TAG" --generate-notes --draft
 
   build:
     needs: release
@@ -93,4 +94,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Gorizont Launcher ${{ github.ref_name }}
+          draft: true
           files: ${{ matrix.files }}
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
