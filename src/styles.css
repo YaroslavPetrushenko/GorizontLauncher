@@ -68,7 +68,7 @@ html,body,#root{height:100%;overflow:hidden}body{min-width:0}
 .news{align-self:stretch;max-height:none;min-height:0;padding:22px 6px 22px 25px}
 .play-button{position:relative}
 footer{height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 48px;border-top:1px solid #252525;font-size:9px;letter-spacing:1px;color:#52525b}
-.app-shell>.content{grid-template-rows:minmax(0,1fr);overflow:hidden}
+.app-shell>.content{grid-template-rows:auto minmax(0,1fr);overflow:hidden}
 .app-shell>.content .news{height:100%;overflow-y:auto}
 .app-shell>footer{position:relative;bottom:auto;left:auto;right:auto}
 .pack-line{font-size:11px;color:#71717a;margin:-4px 0 12px}.pack-line b{color:#facc15}
@@ -128,6 +128,9 @@ footer{height:44px;display:flex;align-items:center;justify-content:space-between
 /* ---- Mods Section ---- */
 .mods-section{width:100%;max-width:720px}
 .mods-section .user-mods{padding:0}
+.app-shell>.content>.main-tabs{grid-column:1/-1;align-self:start;margin:18px 0 0;padding-bottom:10px}
+.app-shell>.content>.mods-section{grid-column:1/-1;align-self:stretch;max-width:none;min-height:0;overflow-y:auto;padding:16px 8px 16px 0;scrollbar-width:thin;scrollbar-color:#3f3f46 transparent}
+.app-shell>.topbar{height:64px}.app-shell>.content .hero h1{font-size:44px;margin:12px 0 12px}.app-shell>.content .hero-copy{margin:0 0 18px}.app-shell>.content .welcome-chip{margin-bottom:12px}.app-shell>.content .security-note{margin-top:12px}
 
 /* ---- Additional (optional) mods ---- */
 .extra-mods{padding:0}

@@ -360,10 +360,8 @@ async fn fetch_extra_mods_catalog(config: &LauncherConfig) -> Result<(String, Ex
     }
 
     let asset_name = config.extra_mods_catalog_asset.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or("extra-mods.json");
-    let response = client.get(releases_api_url(config)).header("User-Agent", "GorizontLauncher/1.0").send().await
-        .map_err(|e| format!("Не удалось получить список релизов: {e}"))?
-        .error_for_status().map_err(|e| format!("GitHub API недоступен: {e}"))?;
-    let releases: Vec<Release> = response.json().await.map_err(|e| format!("Не удалось разобрать релизы: {e}"))?;
+    let releases_text = fetch_releases_text(config).await.map_err(|e| format!("Не удалось получить список релизов: {e}"))?;
+    let releases: Vec<Release> = serde_json::from_str(&releases_text).map_err(|e| format!("Не удалось разобрать релизы: {e}"))?;
     let asset = releases.iter()
         .filter(|r| !r.draft)
         .find_map(|r| r.assets.iter().find(|a| a.name == asset_name).map(|a| a.browser_download_url.clone()));
@@ -603,6 +601,48 @@ fn releases_api_url(config: &LauncherConfig) -> String {
     format!("https://api.github.com/repos/{}/{}/releases?per_page=30", config.github_owner, config.github_repo)
 }
 
+struct ReleasesCache { etag: Option<String>, body: Option<String>, fetched: Option<std::time::Instant> }
+static RELEASES_CACHE: std::sync::Mutex<ReleasesCache> = std::sync::Mutex::new(ReleasesCache { etag: None, body: None, fetched: None });
+
+/// One shared GitHub releases request for the whole launcher. The answer is cached for 2 minutes and
+/// revalidated with ETag (a 304 does not count against the unauthenticated 60 requests/hour limit).
+/// If GitHub refuses (403/rate limit) or is unreachable, the last good answer is used.
+async fn fetch_releases_text(config: &LauncherConfig) -> Result<String, String> {
+    let (etag, cached) = {
+        let cache = RELEASES_CACHE.lock().map_err(|_| "cache lock".to_string())?;
+        if let (Some(body), Some(at)) = (&cache.body, cache.fetched) {
+            if at.elapsed() < std::time::Duration::from_secs(120) { return Ok(body.clone()); }
+        }
+        (cache.etag.clone(), cache.body.clone())
+    };
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
+    let mut request = client.get(releases_api_url(config)).header("User-Agent", "GorizontLauncher/1.0").header("Accept", "application/vnd.github+json");
+    if cached.is_some() { if let Some(tag) = &etag { request = request.header("If-None-Match", tag.as_str()); } }
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return cached.ok_or_else(|| format!("запрос: {e}")),
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        if let Some(body) = cached {
+            if let Ok(mut cache) = RELEASES_CACHE.lock() { cache.fetched = Some(std::time::Instant::now()); }
+            return Ok(body);
+        }
+    }
+    if !status.is_success() { return cached.ok_or_else(|| format!("GitHub ответил {status}")); }
+    let new_etag = response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(String::from);
+    let body = response.text().await.map_err(|e| format!("чтение ответа: {e}"))?;
+    if let Ok(mut cache) = RELEASES_CACHE.lock() { cache.etag = new_etag; cache.body = Some(body.clone()); cache.fetched = Some(std::time::Instant::now()); }
+    Ok(body)
+}
+
+/// Release list for the news panel (same cached request as the updater).
+#[tauri::command]
+async fn get_releases_json() -> Result<String, String> {
+    let config = launcher_config()?;
+    fetch_releases_text(&config).await
+}
+
 fn version_newer(candidate: &str, current: &str) -> bool {
     let parse = |version: &str| version.split('.').map(|part| part.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
     let candidate = parse(candidate); let current = parse(current);
@@ -656,19 +696,8 @@ fn verify_integrity_manifest(
 
 /// Download and parse the file integrity manifest from GitHub
 async fn download_integrity_manifest(config: &LauncherConfig) -> Result<Option<FileIntegrityManifest>, String> {
-    let client = reqwest::Client::new();
-    let response = match client.get(releases_api_url(config)).header("User-Agent", "GorizontLauncher/1.0").send().await {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-    let response = match response.error_for_status() {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-    let releases: Vec<Release> = match response.json().await {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
+    let Ok(releases_text) = fetch_releases_text(config).await else { return Ok(None) };
+    let Ok(releases) = serde_json::from_str::<Vec<Release>>(&releases_text) else { return Ok(None) };
     
     for release in releases {
         if let Some(asset) = release.assets.iter().find(|a| a.name == "file-manifest.json") {
@@ -802,7 +831,7 @@ async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: S
 #[tauri::command]
 async fn check_launcher_update() -> Result<Option<LauncherUpdate>, String> {
     let config = launcher_config()?;
-    let releases: Vec<serde_json::Value> = reqwest::Client::new().get(releases_api_url(&config)).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    let releases: Vec<serde_json::Value> = serde_json::from_str(&fetch_releases_text(&config).await?).map_err(|e| e.to_string())?;
     let current = env!("CARGO_PKG_VERSION");
     for release in releases { let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default(); if !tag.starts_with("launcher-v") { continue; } let version = tag.trim_start_matches("launcher-v"); if !version_newer(version, current) { continue; } if let Some(asset) = release.get("assets").and_then(|v| v.as_array()).and_then(|assets| assets.iter().find(|a| a.get("name").and_then(|v| v.as_str()).map(|n| n.ends_with("-setup.exe")).unwrap_or(false))) { return Ok(Some(LauncherUpdate { version: version.into(), url: asset.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or_default().into(), size: asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0) })); } }
     Ok(None)
@@ -866,11 +895,8 @@ async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Latest published modpack version on GitHub (None when offline or no release has the pack asset).
 async fn latest_pack_version(config: &LauncherConfig) -> Result<Option<String>, String> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().map_err(|e| format!("client: {e}"))?;
-    let response = client.get(releases_api_url(config)).header("User-Agent", "GorizontLauncher/1.0").send().await.map_err(|e| format!("запрос: {e}"))?;
-    let status = response.status();
-    if !status.is_success() { return Err(format!("GitHub ответил {status}")); }
-    let releases = response.json::<Vec<Release>>().await.map_err(|e| format!("разбор ответа: {e}"))?;
+    let releases_text = fetch_releases_text(config).await?;
+    let releases = serde_json::from_str::<Vec<Release>>(&releases_text).map_err(|e| format!("разбор ответа: {e}"))?;
     Ok(releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == config.modpack_asset)).map(|release| release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string()))
 }
 
@@ -1166,10 +1192,9 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     }
     
     // THIRD: Fallback to GitHub releases (only if no local modpack configured)
-    let client = reqwest::Client::new();
-    if let Ok(response) = client.get(releases_api_url(&effective_config)).header("User-Agent", "GorizontLauncher/0.1").send().await {
-        if let Ok(response) = response.error_for_status() {
-            if let Ok(releases) = response.json::<Vec<Release>>().await {
+    if let Ok(releases_text) = fetch_releases_text(&effective_config).await {
+        {
+            if let Ok(releases) = serde_json::from_str::<Vec<Release>>(&releases_text) {
                 if let Some(release) = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == effective_config.modpack_asset)) {
                     let latest = release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string();
                     let asset_url = release.assets.iter().find(|a| a.name == effective_config.modpack_asset).map(|a| a.browser_download_url.clone());
@@ -2684,6 +2709,7 @@ fn main() {
             download_and_extract_modpack,
             check_and_update_modpack,
             check_launcher_update,
+            get_releases_json,
             download_launcher_update,
             launch_minecraft,
             link_ip_to_account,

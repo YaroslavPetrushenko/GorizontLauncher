@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Copy, Check, Users } from 'lucide-react';
 import type { T } from '../i18n';
-import { GITHUB_OWNER, GITHUB_REPO, SERVER_ADDRESS, SERVER_PORT } from '../config';
+import { invoke } from '@tauri-apps/api/core';
+import { SERVER_ADDRESS, SERVER_PORT } from '../config';
 
 export type ServerState = { status: 'checking' | 'online' | 'offline'; players?: number; max?: number };
 type NewsItem = { id: string; date: string; tag: string; title: string; text: string; url?: string };
@@ -44,11 +45,13 @@ export default function News({ t, lang }: { t: T; lang: string }) {
   const [items, setItems] = useState<NewsItem[] | null>(null);
   useEffect(() => {
     let cancelled = false;
-    fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases?per_page=6`)
-      .then(r => r.ok ? r.json() : Promise.reject(new Error(String(r.status))))
+    // The launcher backend owns the one cached GitHub request (ETag + 2 min cache), so the news panel
+    // does not spend the unauthenticated API rate limit that pack updates need.
+    invoke<string>('get_releases_json')
+      .then(text => JSON.parse(text) as any[])
       .then((releases: any[]) => {
         if (cancelled) return;
-        const mapped = releases.filter(r => !r.draft).map(r => ({
+        const mapped = releases.filter(r => !r.draft).slice(0, 6).map(r => ({
           id: String(r.id),
           date: new Date(r.published_at || r.created_at).toLocaleDateString(lang === 'ru' ? 'ru-RU' : 'en-GB'),
           tag: String(r.tag_name).startsWith('launcher-v') ? 'launcher' : 'modpack',
