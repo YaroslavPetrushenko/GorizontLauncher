@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
-import { Settings as SettingsIcon, Play, Zap, ShieldCheck, Download, Loader2, Puzzle, FolderOpen } from 'lucide-react';
+import { Settings as SettingsIcon, Play, Zap, Download, Loader2, Puzzle, FolderOpen } from 'lucide-react';
 import AuthScreen from './components/AuthScreen';
 import ProgressBar from './components/ProgressBar';
 import UpdateOverlay from './components/UpdateOverlay';
@@ -164,7 +164,7 @@ export default function App() {
 
   return <div className="app-shell">
     <header className="topbar">
-      <div className="brand"><div className="brand-mark"><img src="/logo.png" alt="" /></div><div><strong>GORIZONT</strong><span>NETWORK</span></div></div>
+      <div className="brand"><div className="brand-mark"><img src="/logo.png" alt="" /></div><div><strong>HORIZON</strong><span>NETWORK</span></div></div>
       <div className="top-actions">
         <span className={`online-dot ${server.status}`} /> {serverLabel}
         {account && <button className="settings-button" onClick={() => setShowSettings(true)} aria-label={t('settings')}><SettingsIcon size={19} /></button>}
@@ -180,7 +180,7 @@ export default function App() {
             onClick={() => setActiveTab('main')}
             className={`main-tab ${activeTab === 'main' ? 'active' : ''}`}
           >
-            <Zap size={18} /> {t('heroKicker').replace('NEOFORGE EDITION', '').trim() || 'ГЛАВНАЯ'}
+            <Zap size={18} /> {t('tabMain')}
           </button>
           <button
             role="tab"
@@ -203,7 +203,7 @@ export default function App() {
         {activeTab === 'main' && (
           <section className="hero">
             <div className="hero-kicker"><span /> {t('heroKicker')}</div>
-            <h1>{t('heroTitle1')}<br /><em>{t('heroTitle2')}</em></h1>
+            <h1>{t('heroTitle1')}{t('heroTitle2') && <><br /><em>{t('heroTitle2')}</em></>}</h1>
             <p className="hero-copy">{t('heroCopy')}</p>
             <div className="welcome-chip"><span className="avatar"><PlayerAvatar username={account.username} uuid={account.uuid} /></span><div><small>{t('welcome')}</small><strong>{account.username}</strong></div></div>
             <div className="pack-line">{t('packVersion')}: <b>{!settings.localVersion || settings.localVersion === '0.0.0' ? '—' : `v${settings.localVersion}`}</b></div>
@@ -212,7 +212,6 @@ export default function App() {
               {busy ? t('loading') : t('play')}<span />
             </button>
             {(progress || status) && <ProgressBar percent={progress?.percent ?? 0} speed={progress?.speed} label={status ?? t('ready')} />}
-            <div className="security-note"><ShieldCheck size={16} /> {t('authNote')}</div>
           </section>
         )}
 
