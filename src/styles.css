@@ -319,3 +319,7 @@ footer{height:44px;display:flex;align-items:center;justify-content:space-between
 .um-actions{display:flex;gap:7px;align-items:center;margin-top:auto}
 .um-actions .mr-btn{flex:1}
 .um-actions .mod-action-btn{width:32px;height:32px;flex:0 0 auto}
+
+/* ---- brand logo ---- */
+.brand-mark{background:none;border-radius:0;width:42px;height:42px}
+.brand-mark img{width:100%;height:100%;object-fit:contain;display:block}

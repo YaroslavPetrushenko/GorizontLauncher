@@ -164,7 +164,7 @@ export default function App() {
 
   return <div className="app-shell">
     <header className="topbar">
-      <div className="brand"><div className="brand-mark"><Zap size={20} fill="currentColor" /></div><div><strong>GORIZONT</strong><span>NETWORK</span></div></div>
+      <div className="brand"><div className="brand-mark"><img src="/logo.png" alt="" /></div><div><strong>GORIZONT</strong><span>NETWORK</span></div></div>
       <div className="top-actions">
         <span className={`online-dot ${server.status}`} /> {serverLabel}
         {account && <button className="settings-button" onClick={() => setShowSettings(true)} aria-label={t('settings')}><SettingsIcon size={19} /></button>}
