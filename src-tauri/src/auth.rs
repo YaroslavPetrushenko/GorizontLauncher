@@ -26,6 +26,9 @@ pub struct AuthResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub user: UserResponse,
+    /// Token of the game server for this launcher; opens the game session at every start (no password needed).
+    #[serde(default)]
+    pub server_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,6 +223,7 @@ pub async fn register_user(
     .map_err(|e| format!("Failed to create session: {}", e))?;
     
     Ok(AuthResponse {
+        server_token: None,
         access_token,
         refresh_token,
         user: UserResponse {
@@ -279,6 +283,7 @@ pub async fn login_user(
     .map_err(|e| format!("Failed to create session: {}", e))?;
     
     Ok(AuthResponse {
+        server_token: None,
         access_token,
         refresh_token,
         user: UserResponse {
@@ -364,6 +369,7 @@ pub async fn refresh_tokens(
     .map_err(|e| format!("Failed to create new session: {}", e))?;
     
     Ok(AuthResponse {
+        server_token: None,
         access_token,
         refresh_token: new_refresh_token,
         user: UserResponse {

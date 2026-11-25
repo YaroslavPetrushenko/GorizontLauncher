@@ -2026,10 +2026,14 @@ async fn auth_login(
     // The game server is the source of truth for accounts; fall back to the local
     // mirror only when the server is unreachable.
     require_server_key()?;
+    let mut server_token: Option<String> = None;
     if server_hmac_secret().is_some() {
         match server_auth_login(request.nickname.clone(), request.password.clone()).await {
             Ok(reply) => match reply.status.as_str() {
-                "ok" => {}
+                "ok" => {
+                    // An older plugin on the server issues no token: "legacy" lets the launcher play on against it.
+                    server_token = Some(reply.token.clone().unwrap_or_else(|| "legacy".into()));
+                }
                 "invalid_password" => return Err("Неверный пароль".into()),
                 "not_found" => return Err("Пользователь не найден".into()),
                 "invalid_input" => return Err("Некорректный ник или пароль".into()),
@@ -2039,7 +2043,8 @@ async fn auth_login(
             Err(e) => eprintln!("[AUTH] Server login unavailable, using local account: {e}"),
         }
     }
-    let response = local_login_or_mirror(&pool, &request.nickname, &request.password, &request.device_fp).await?;
+    let mut response = local_login_or_mirror(&pool, &request.nickname, &request.password, &request.device_fp).await?;
+    response.server_token = server_token;
     remember_active_account(&active, &response);
     Ok(response)
 }
@@ -2051,10 +2056,14 @@ async fn auth_register(
     request: RegisterRequest,
 ) -> Result<AuthResponse, String> {
     require_server_key()?;
+    let mut server_token: Option<String> = None;
     if server_hmac_secret().is_some() {
         match server_auth_register(request.nickname.clone(), request.password.clone()).await {
             Ok(reply) => match reply.status.as_str() {
-                "registered" => {}
+                "registered" => {
+                    // An older plugin on the server issues no token: "legacy" lets the launcher play on against it.
+                    server_token = Some(reply.token.clone().unwrap_or_else(|| "legacy".into()));
+                }
                 "already_exists" => return Err("Этот ник уже зарегистрирован — используйте вход".into()),
                 "invalid_input" => return Err("Некорректный ник или слишком короткий пароль".into()),
                 other => return Err(format!("Сервер авторизации: {other}")),
@@ -2063,10 +2072,11 @@ async fn auth_register(
         }
     }
     // Mirror the account locally so the launcher can still issue tokens offline.
-    let response = match auth::register_user(&pool, &request.nickname, &request.password, &request.device_fp).await {
+    let mut response = match auth::register_user(&pool, &request.nickname, &request.password, &request.device_fp).await {
         Ok(response) => response,
         Err(_) => local_login_or_mirror(&pool, &request.nickname, &request.password, &request.device_fp).await?,
     };
+    response.server_token = server_token;
     remember_active_account(&active, &response);
     Ok(response)
 }
@@ -3012,6 +3022,9 @@ struct ServerAuthReply {
     status: String,
     #[serde(default)]
     error: Option<String>,
+    /// Launcher token issued with a successful login / registration.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// Build a fresh signature header: t=<unix>,n=<nonce>,v1=<hmac over "t\nnonce\nbody">.
@@ -3078,6 +3091,23 @@ async fn server_auth_register(nickname: String, password: String) -> Result<Serv
 async fn server_auth_login(nickname: String, password: String) -> Result<ServerAuthReply, String> {
     let body = credentials_body(&nickname, &password)?;
     server_api_call("/auth/login", Some(body)).await
+}
+
+/// At every game start: shows the launcher token to the game server, which then lets this player in from the
+/// current address without /login. Returns "ok", "invalid" (the token is not accepted: sign in again),
+/// "no_token" (signed in with an older launcher: sign in again) or "unavailable" (server not reachable: play on).
+#[tauri::command]
+async fn refresh_server_session(username: String, token: Option<String>) -> Result<String, String> {
+    let Some(token) = token.filter(|t| !t.trim().is_empty()) else { return Ok("no_token".into()) };
+    let body = serde_json::to_string(&serde_json::json!({ "nickname": username, "token": token })).map_err(|e| e.to_string())?;
+    match server_api_call("/auth/refresh", Some(body)).await {
+        Ok(reply) => Ok(match reply.status.as_str() {
+            "ok" => "ok",
+            "invalid_token" => "invalid",
+            _ => "unavailable",
+        }.to_string()),
+        Err(e) => { eprintln!("[AUTH] game session refresh unavailable: {e}"); Ok("unavailable".into()) }
+    }
 }
 
 /// Sign the check-player request; used to confirm the launcher session server-side.
@@ -3363,6 +3393,7 @@ fn main() {
             get_system_memory,
             prepare_game_files,
             lookup_mojang_profile,
+            refresh_server_session,
             get_player_skin,
             modrinth_mod_versions,
             download_and_extract_modpack,

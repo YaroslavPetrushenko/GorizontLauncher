@@ -9,6 +9,7 @@ type AuthMode = 'login' | 'register' | 'forgot';
 interface AuthResponse {
   access_token: string;
   refresh_token: string;
+  server_token?: string | null;
   user: {
     id: string;
     nickname: string;
@@ -34,7 +35,7 @@ interface ForgotPasswordRequest {
   nickname: string;
 }
 
-type Props = { t: T; onDone: (account: Account) => void };
+type Props = { t: T; onDone: (account: Account) => void; notice?: string };
 
 // Generate or retrieve device fingerprint
 function getDeviceFingerprint(): string {
@@ -46,7 +47,7 @@ function getDeviceFingerprint(): string {
   return fp;
 }
 
-export default function AuthScreen({ t, onDone }: Props) {
+export default function AuthScreen({ t, onDone, notice }: Props) {
   const [mode, setMode] = useState<AuthMode>('login');
   const [nickname, setNickname] = useState('');
   const [password, setPassword] = useState('');
@@ -102,6 +103,7 @@ export default function AuthScreen({ t, onDone }: Props) {
       username: response.user.nickname,
       uuid: response.user.id,
       passHash: response.access_token,
+      serverToken: response.server_token ?? undefined,
     });
   }, [onDone]);
 
@@ -317,6 +319,7 @@ export default function AuthScreen({ t, onDone }: Props) {
 
   return (
     <form className="auth-card" onSubmit={handleSubmit}>
+      {notice && <div className="form-error" role="status"><AlertCircle size={14} /> {notice}</div>}
       <div className="auth-icon"><UserRound size={26} /></div>
       <h2>{mode === 'login' ? t('authLogin') : mode === 'register' ? t('authRegister') : t('authForgotPassword')}</h2>
       <p className="auth-subtitle">

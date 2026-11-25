@@ -9,6 +9,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.util.Base64;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,11 +35,22 @@ public final class LauncherSessions {
         Session(long until, String ip) { this.until = until; this.ip = ip == null ? "" : ip; }
     }
 
+    /** A long-lived launcher token: only its SHA-256 is stored, the launcher keeps the token itself. */
+    private static final class TokenEntry {
+        final String hash;
+        final long until;
+        TokenEntry(String hash, long until) { this.hash = hash; this.until = until; }
+    }
+
+    private static final long TOKEN_MILLIS = 30L * 24 * 60 * 60 * 1000;
+    private static final SecureRandom RANDOM = new SecureRandom();
+
     private final Logger logger;
     private final Path file;
     private final long sessionMillis;
     private volatile boolean bindToIp;
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
+    private final Map<String, TokenEntry> tokens = new ConcurrentHashMap<>();
 
     public LauncherSessions(File dataFolder, long sessionMinutes, boolean bindToIp, Logger logger) {
         this.logger = logger;
@@ -77,6 +92,57 @@ public final class LauncherSessions {
         return true;
     }
 
+    private static String sha256Hex(String text) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8));
+            StringBuilder out = new StringBuilder();
+            for (byte b : digest) out.append(String.format("%02x", b));
+            return out.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Gives the launcher a token after a successful password login/registration. The launcher presents it at every
+     * game start to open a fresh session from its current address, without asking for the password again.
+     * A new login replaces the old token.
+     */
+    public String issueToken(String nickname) {
+        byte[] raw = new byte[32];
+        RANDOM.nextBytes(raw);
+        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(raw);
+        tokens.put(key(nickname), new TokenEntry(sha256Hex(token), System.currentTimeMillis() + TOKEN_MILLIS));
+        save();
+        return token;
+    }
+
+    /** True if the token belongs to the nickname and is alive. A good token is renewed (sliding 30 days). */
+    public boolean verifyToken(String nickname, String token) {
+        if (nickname == null || nickname.isBlank() || token == null || token.isBlank()) return false;
+        TokenEntry entry = tokens.get(key(nickname));
+        if (entry == null) return false;
+        if (entry.until <= System.currentTimeMillis()) {
+            tokens.remove(key(nickname));
+            save();
+            return false;
+        }
+        boolean same = MessageDigest.isEqual(entry.hash.getBytes(StandardCharsets.UTF_8), sha256Hex(token).getBytes(StandardCharsets.UTF_8));
+        if (same) {
+            tokens.put(key(nickname), new TokenEntry(entry.hash, System.currentTimeMillis() + TOKEN_MILLIS));
+            save();
+        }
+        return same;
+    }
+
+    /** Removes the session and the token (account deleted or its password changed). */
+    public void revoke(String nickname) {
+        if (nickname == null) return;
+        boolean changed = sessions.remove(key(nickname)) != null;
+        changed |= tokens.remove(key(nickname)) != null;
+        if (changed) save();
+    }
+
     public void forget(String nickname) {
         if (nickname == null) return;
         if (sessions.remove(key(nickname)) != null) save();
@@ -103,7 +169,13 @@ public final class LauncherSessions {
                 String ip = entry.has("ip") ? entry.get("ip").getAsString() : "";
                 if (until > now) sessions.put(key(nickname), new Session(until, ip));
             }
-            logger.info("Loaded " + sessions.size() + " launcher session(s)");
+            JsonObject tokenEntries = root.has("tokens") ? root.getAsJsonObject("tokens") : new JsonObject();
+            for (String nickname : tokenEntries.keySet()) {
+                JsonObject entry = tokenEntries.getAsJsonObject(nickname);
+                long until = entry.get("until").getAsLong();
+                if (until > now) tokens.put(key(nickname), new TokenEntry(entry.get("hash").getAsString(), until));
+            }
+            logger.info("Loaded " + sessions.size() + " launcher session(s) and " + tokens.size() + " token(s)");
         } catch (IOException | RuntimeException e) {
             logger.warning("Failed to read launcher_sessions.json: " + e.getMessage());
         }
@@ -121,9 +193,19 @@ public final class LauncherSessions {
                     entries.add(nickname, entry);
                 }
             });
+            JsonObject tokenEntries = new JsonObject();
+            tokens.forEach((nickname, token) -> {
+                if (token.until > now) {
+                    JsonObject entry = new JsonObject();
+                    entry.addProperty("hash", token.hash);
+                    entry.addProperty("until", token.until);
+                    tokenEntries.add(nickname, entry);
+                }
+            });
             JsonObject root = new JsonObject();
-            root.addProperty("schemaVersion", 2);
+            root.addProperty("schemaVersion", 3);
             root.add("sessions", entries);
+            root.add("tokens", tokenEntries);
 
             Path parent = file.getParent();
             if (parent != null) Files.createDirectories(parent);

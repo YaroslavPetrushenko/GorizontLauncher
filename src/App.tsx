@@ -29,6 +29,7 @@ export default function App() {
   const [account, setAccount] = useState<Account | null>(null);
   const [settings, setSettings] = useState<Settings>(() => { try { return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { return defaults; } });
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [authNotice, setAuthNotice] = useState('');
   const [launcherUpdate, setLauncherUpdate] = useState<LauncherUpdate | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -117,6 +118,9 @@ export default function App() {
     setBusy(true);
     setStatus(t('checkingUpdates'));
     try {
+      // Opens the game session on the server for this launch, so the game does not ask for /login.
+      const session = await invoke<string>('refresh_server_session', { username: account.username, token: account.serverToken ?? null }).catch(() => 'unavailable');
+      if (session === 'invalid' || session === 'no_token') { logout(); setAuthNotice(t('sessionExpired')); return; }
       if (!(await prepare())) return;
       setStatus(t('launching'));
       await invoke('launch_minecraft', { username: account.username, ramMb: effectiveRam(settings, memory), gameDir: settings.gameDir, accessToken: account.passHash });
@@ -171,7 +175,7 @@ export default function App() {
       </div>
     </header>
 
-    {!account ? <main className="content auth-content"><AuthScreen t={t} onDone={next => { saveAccount(next); setAccount(next); }} /></main> :
+    {!account ? <main className="content auth-content"><AuthScreen t={t} notice={authNotice} onDone={next => { saveAccount(next); setAuthNotice(''); setAccount(next); }} /></main> :
       <main className="content">
         <nav className="main-tabs" role="tablist">
           <button

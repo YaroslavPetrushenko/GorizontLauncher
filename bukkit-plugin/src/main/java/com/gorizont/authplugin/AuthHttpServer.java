@@ -79,6 +79,7 @@ public final class AuthHttpServer {
         server.createContext("/health", exchange -> respond(exchange, 200, "{\"status\":\"ok\"}"));
         server.createContext("/auth/register", this::handleRegister);
         server.createContext("/auth/login", this::handleLogin);
+        server.createContext("/auth/refresh", this::handleRefresh);
         server.createContext("/auth/check-player", this::handleCheckPlayer);
         server.createContext("/mods/moderation", this::handleModerationList);
         server.createContext("/mods/moderate", this::handleModerate);
@@ -110,6 +111,7 @@ public final class AuthHttpServer {
                 case REGISTERED -> {
                     reply.addProperty("status", "registered");
                     sessions.authorize(nickname, ip);
+                    reply.addProperty("token", sessions.issueToken(nickname));
                 }
                 case ALREADY_EXISTS -> {
                     reply.addProperty("status", "already_exists");
@@ -146,6 +148,7 @@ public final class AuthHttpServer {
                     reply.addProperty("status", "ok");
                     guard.recordSuccess(ip);
                     sessions.authorize(nickname, ip);
+                    reply.addProperty("token", sessions.issueToken(nickname));
                 }
                 case INVALID_PASSWORD -> {
                     guard.recordFailure(ip);
@@ -165,6 +168,35 @@ public final class AuthHttpServer {
                     reply.addProperty("status", "error");
                     reply.addProperty("error", "Внутренняя ошибка сервера");
                 }
+            }
+            return reply;
+        });
+    }
+
+    /**
+     * The launcher opens a fresh session at every game start: it shows the token it got at login. The session is
+     * tied to the address of THIS request, which is the address the game then connects from. No password is needed
+     * and none is stored in the launcher.
+     */
+    private void handleRefresh(HttpExchange exchange) throws IOException {
+        withSignedJson(exchange, (body, ip) -> {
+            String nickname = stringField(body, "nickname");
+            String token = stringField(body, "token");
+            JsonObject reply = new JsonObject();
+            long lockedMillis = guard.lockRemainingMillis(ip);
+            if (lockedMillis > 0) {
+                reply.addProperty("status", "locked");
+                reply.addProperty("error", "Слишком много неудачных попыток. Повторите через " + Math.max(1, lockedMillis / 60_000L) + " мин.");
+                return reply;
+            }
+            if (token == null || token.isBlank()) {
+                reply.addProperty("status", "invalid_token");
+            } else if (sessions.verifyToken(nickname, token)) {
+                sessions.authorize(nickname, ip);
+                reply.addProperty("status", "ok");
+            } else {
+                guard.recordFailure(ip);
+                reply.addProperty("status", "invalid_token");
             }
             return reply;
         });

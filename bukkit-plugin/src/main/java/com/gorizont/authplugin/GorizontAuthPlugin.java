@@ -574,6 +574,9 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                 if (!stillOnline(player)) return;
                 switch (result[0]) {
                     case OK -> {
+                        // Launchers that hold a token of the old password must sign in again.
+                        sessions.revoke(username);
+                        sessions.authorize(username, ip);
                         player.sendMessage(PREFIX + "§aПароль изменён.");
                         getLogger().info("Player " + username + " changed the password");
                     }
@@ -646,7 +649,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                         return true;
                     }
                     boolean removed = accounts.remove(args[1]);
-                    sessions.forget(args[1]);
+                    sessions.revoke(args[1]);
                     authenticatedPlayers.remove(args[1].toLowerCase());
                     sender.sendMessage(PREFIX + (removed ? "§aАккаунт " + args[1] + " удалён." : "§cАккаунта " + args[1] + " нет."));
                     getLogger().info(sender.getName() + " unregistered " + args[1] + " (" + (removed ? "removed" : "not found") + ")");
