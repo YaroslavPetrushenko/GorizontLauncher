@@ -307,11 +307,25 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
         return enableAuth && forceLoginOnJoin && !authenticatedPlayers.contains(player.getName().toLowerCase());
     }
 
+    /** The one command this player needs: /login when the nickname has an account, /register when it has none. */
+    private boolean hasAccount(Player player) {
+        return accounts.exists(player.getName());
+    }
+
+    private String neededCommand(Player player) {
+        return hasAccount(player) ? "/login <пароль>" : "/register <пароль> <пароль>";
+    }
+
     private void sendLoginPrompt(Player player) {
-        player.sendMessage(PREFIX + "§eВы вошли не через наш лаунчер, нужна регистрация на сервере.");
-        player.sendMessage(PREFIX + "§fНовый аккаунт: §e/register <пароль> <пароль>");
-        player.sendMessage(PREFIX + "§fУже регистрировались: §e/login <пароль>");
-        player.sendMessage(PREFIX + "§7Без входа вы не сможете играть.");
+        boolean registered = hasAccount(player);
+        if (registered) {
+            player.sendMessage(PREFIX + "§eВведите пароль, чтобы войти: §a/login <пароль>");
+        } else {
+            player.sendMessage(PREFIX + "§eУ вас ещё нет аккаунта. Создайте его, придумав пароль: §a/register <пароль> <пароль>");
+        }
+        player.sendMessage(PREFIX + "§7Без входа играть нельзя.");
+        // Also on the screen, so nobody has to dig through the chat.
+        player.sendTitle(registered ? "§eВойдите в аккаунт" : "§eРегистрация", "§a" + neededCommand(player), 5, 100, 10);
     }
 
     private void startLoginReminder(Player player) {
@@ -334,7 +348,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
                 public void run() {
                     Player p = Bukkit.getPlayerExact(name);
                     if (p != null && p.isOnline() && needsLogin(p)) {
-                        p.kickPlayer(PREFIX + "§cВремя на вход вышло (" + loginTimeoutSeconds + " с). Зайдите снова и введите /login или /register.");
+                        p.kickPlayer(PREFIX + "§cВремя на вход вышло (" + loginTimeoutSeconds + " с). Зайдите снова и введите " + neededCommand(p) + ".");
                     }
                 }
             }.runTaskLater(this, loginTimeoutSeconds * 20L);
@@ -343,7 +357,7 @@ public class GorizontAuthPlugin extends JavaPlugin implements Listener {
 
     private void denyUntilLogin(Player player, Cancellable event) {
         event.setCancelled(true);
-        player.sendMessage(PREFIX + "§cСначала войдите: §e/login <пароль>§c или §e/register <пароль> <пароль>");
+        player.sendMessage(PREFIX + "§cСначала войдите: §a" + neededCommand(player));
     }
 
     @EventHandler(ignoreCancelled = true)
