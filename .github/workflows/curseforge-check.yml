@@ -19,3 +19,17 @@ jobs:
         env:
           CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
         run: cargo test curseforge_live -- --ignored --nocapture
+      - name: Build a test installer (not a release)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          GORIZONT_HMAC_SECRET: ${{ secrets.GORIZONT_HMAC_SECRET }}
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        run: npm run tauri build -- --bundles nsis
+      - name: Keep the installer for download
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gorizont-test-windows
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 3
