@@ -99,6 +99,7 @@ jobs:
         env:
           # Baked into the launcher with option_env!; never committed to the repository.
           GORIZONT_HMAC_SECRET: ${{ secrets.GORIZONT_HMAC_SECRET }}
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
       - name: Put the system into the file names
         shell: bash
         env:

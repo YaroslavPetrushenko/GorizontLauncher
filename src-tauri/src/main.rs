@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod auth;
+mod curseforge;
 mod db;
 mod http_server;
 mod servers;
@@ -1702,6 +1703,15 @@ fn filter_jvm_args(args: &[String], java_info: &JavaInfo, _required_java: u32) -
 
 /// Escape a Windows command argument: quote if it contains spaces or double-quotes.
 /// Backslashes in Windows paths are normal and do NOT need quoting.
+/// UUID of an offline-mode player: the version 3 UUID of "OfflinePlayer:<name>", as Minecraft servers compute it
+/// (32 hex digits, no dashes).
+fn offline_uuid(name: &str) -> String {
+    let mut hash = md5::compute(format!("OfflinePlayer:{name}").as_bytes()).0;
+    hash[6] = (hash[6] & 0x0f) | 0x30;
+    hash[8] = (hash[8] & 0x3f) | 0x80;
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn escape_windows_arg(arg: &str) -> String {
     // Arguments are passed to the program directly (no shell), so only Windows' own quoting needs this.
     if !cfg!(windows) { return arg.to_string(); }
@@ -1831,7 +1841,9 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
     let separator = if cfg!(windows) { ";" } else { ":" };
     let classpath = cp_entries.join(separator);
     let access_token_value = access_token.unwrap_or_else(|| "0".to_string());
-    let uuid_value = "00000000000000000000000000000000".to_string();
+    // The same UUID the game server derives from the nickname (offline mode), so the client and the server agree
+    // on who this player is; mods and chat plugins look players up by it.
+    let uuid_value = offline_uuid(&username);
     let replacements = [("${auth_player_name}", username.clone()), ("${version_name}", version_id.clone()), ("${game_directory}", game_path.to_string_lossy().to_string()), ("${assets_root}", game_path.join("assets").to_string_lossy().to_string()), ("${assets_index_name}", assets_index.clone()), ("${auth_access_token}", access_token_value), ("${auth_uuid}", uuid_value), ("${auth_xuid}", "".into()), ("${clientid}", "".into()), ("${launcher_name}", "GorizontLauncher".into()), ("${launcher_version}", env!("CARGO_PKG_VERSION").into()), ("${classpath}", classpath.clone()), ("${natives_directory}", escape_windows_arg(&game_path.join("versions").join(&version_id).join("natives").to_string_lossy().to_string())), ("${library_directory}", escape_windows_arg(&game_path.join("libraries").to_string_lossy().to_string())), ("${classpath_separator}", separator.into()), ("${user_type}", "mojang".into()), ("${version_type}", "release".into()), ("${resolution_width}", "854".into()), ("${resolution_height}", "480".into()), ("${quickPlayPath}", "".into()), ("${quickPlaySingleplayer}", "false".into()), ("${quickPlayMultiplayer}", "false".into()), ("${quickPlayRealms}", "false".into())];
     let LaunchArguments { jvm, game } = profile.arguments.unwrap_or(LaunchArguments { jvm: None, game: None });
     let mut args = vec![format!("-Xmx{ram}M"), format!("-Xms{}M", ram.min(2048))];
@@ -2414,6 +2426,10 @@ struct ModrinthHit {
     client_side: String,
     server_side: String,
     date_modified: Option<String>,
+    /// Page of the mod on its site (set for CurseForge).
+    website_url: Option<String>,
+    /// False when the author forbids downloads by third-party programs.
+    downloadable: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -2430,6 +2446,9 @@ struct ModrinthSearchResponse {
 struct ModrinthHashes {
     #[serde(default)]
     sha512: Option<String>,
+    /// CurseForge publishes MD5 instead of SHA-512.
+    #[serde(default)]
+    md5: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -2584,10 +2603,17 @@ async fn modrinth_search(
     offset: Option<u32>,
     limit: Option<u32>,
     as_moderator: Option<bool>,
+    source: Option<String>,
 ) -> Result<ModrinthSearchResponse, String> {
     let (mc_version, config_loader) = pack_game_version(game_version)?;
     let project_loader = loader.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or(config_loader);
     let client = modrinth_client()?;
+    if source.as_deref() == Some("curseforge") {
+        let mut found = curseforge::search(&client, &mc_version, query.as_deref().unwrap_or(""), index.as_deref(),
+            offset.unwrap_or(0).min(900), limit.unwrap_or(20).clamp(1, 50)).await?;
+        if !as_moderator.unwrap_or(false) { found.hits = hide_blocked(found.hits, &refresh_moderation().await.blocked); }
+        return Ok(found);
+    }
     let facets = modrinth_facets(&mc_version, &project_loader, &categories.unwrap_or_default());
     let offset = offset.unwrap_or(0).min(900);
     let limit = limit.unwrap_or(20).clamp(1, 50);
@@ -2630,6 +2656,8 @@ async fn modrinth_search(
             client_side: h.client_side,
             server_side: h.server_side,
             date_modified: h.date_modified,
+            website_url: None,
+            downloadable: true,
         })
         .collect();
 
@@ -2666,7 +2694,10 @@ struct ModVersionInfo {
 async fn modrinth_fitting_versions(client: &reqwest::Client, game_version: &str, loader: &str, project_id: &str) -> Result<Vec<ModrinthVersion>, String> {
     let loaders_text = serde_json::json!([loader]).to_string();
     let game_versions_text = serde_json::json!([game_version]).to_string();
-    let mut versions: Vec<ModrinthVersion> = client
+    let mut versions: Vec<ModrinthVersion> = if curseforge::is_curseforge(project_id) {
+        curseforge::files(client, game_version, project_id).await?
+    } else {
+        client
         .get(format!("{MODRINTH_API}/project/{project_id}/version"))
         .header("User-Agent", MODRINTH_UA)
         .query(&[("loaders", loaders_text.as_str()), ("game_versions", game_versions_text.as_str())])
@@ -2675,7 +2706,8 @@ async fn modrinth_fitting_versions(client: &reqwest::Client, game_version: &str,
         .error_for_status()
         .map_err(|e| format!("Версии мода недоступны: {e}"))?
         .json().await
-        .map_err(|e| format!("Не удалось разобрать версии мода: {e}"))?;
+        .map_err(|e| format!("Не удалось разобрать версии мода: {e}"))?
+    };
     // Only versions made for exactly this Minecraft version and loader are ever offered or installed.
     versions.retain(|v| v.files.iter().any(|f| f.filename.to_lowercase().ends_with(".jar"))
         && v.game_versions.iter().any(|g| g == game_version)
@@ -2683,6 +2715,10 @@ async fn modrinth_fitting_versions(client: &reqwest::Client, game_version: &str,
     versions.sort_by(|a, b| b.date_published.cmp(&a.date_published));
     Ok(versions)
 }
+
+/// Whether this build can search CurseForge (it has a key).
+#[tauri::command]
+fn curseforge_available() -> bool { curseforge::available() }
 
 /// Versions of a mod the player may choose from. The installed one (if any) is marked.
 #[tauri::command]
@@ -2777,15 +2813,15 @@ async fn modrinth_install_mod(
     }
     let client = modrinth_client()?;
     // Name, description and icon for the card.
-    let project: serde_json::Value = client
-        .get(format!("{MODRINTH_API}/project/{project_id}"))
-        .header("User-Agent", MODRINTH_UA)
-        .send().await
+    let project: serde_json::Value = modrinth_projects(&client, std::slice::from_ref(&project_id)).await
         .map_err(|e| format!("Не удалось получить сведения о моде: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("Сведения о моде недоступны: {e}"))?
-        .json().await
-        .map_err(|e| format!("Не удалось разобрать сведения о моде: {e}"))?;
+        .remove(&project_id)
+        .ok_or_else(|| "Мод не найден".to_string())?;
+    // The same mod from the other site is not installed a second time.
+    let slug = project.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+    if !slug.is_empty() && state.installed.iter().any(|(id, other)| id != &project_id && other.slug.eq_ignore_ascii_case(slug)) {
+        return Err("Этот мод уже установлен (скачан с другого сайта). Удалите его в «Моих модах», если хотите поставить отсюда".into());
+    }
     // One version of a mod at a time: another one is installed only as an explicit replacement.
     let previous = state.installed.get(&project_id).cloned();
     if previous.is_some() && !replace.unwrap_or(false) {
@@ -2805,8 +2841,11 @@ async fn modrinth_install_mod(
         .or_else(|| version.files.iter().find(|f| f.filename.to_lowercase().ends_with(".jar")))
         .ok_or_else(|| "У версии мода нет подходящего .jar файла".to_string())?;
 
+    if file.url.is_empty() && curseforge::is_curseforge(&project_id) {
+        return Err("Автор этого мода запретил скачивание сторонними программами. Откройте мод на CurseForge".into());
+    }
     if !file.url.to_lowercase().starts_with("https://") {
-        return Err("Modrinth вернул небезопасную ссылку на файл".into());
+        return Err("Сайт модов вернул небезопасную ссылку на файл".into());
     }
     let single_segment = Path::new(&file.filename).components().count() == 1;
     if !single_segment || file.filename.contains("..") {
@@ -2854,6 +2893,11 @@ async fn modrinth_install_mod(
     }
     if bytes.is_empty() { return Err("Скачанный файл мода пуст".into()); }
 
+    if let Some(expected) = file.hashes.as_ref().and_then(|h| h.md5.as_deref()) {
+        if !format!("{:x}", md5::compute(&bytes)).eq_ignore_ascii_case(expected) {
+            return Err("Проверка контрольной суммы не пройдена: файл повреждён или подменён".into());
+        }
+    }
     let actual_sha512 = format!("{:x}", sha2::Sha512::digest(&bytes));
     if let Some(expected) = expected_sha512.as_deref() {
         if !actual_sha512.eq_ignore_ascii_case(expected) {
@@ -3198,6 +3242,35 @@ async fn pack_project_ids(game_path: &Path) -> HashSet<String> {
             }
         }
     }
+    let mut projects: HashSet<String> = names.iter().filter_map(|n| cache.get(n)).filter(|id| !id.is_empty()).cloned().collect();
+    projects.extend(pack_curseforge_ids(game_path, &names).await);
+    projects
+}
+
+/// The CurseForge projects of the pack's jars, by fingerprint, remembered on disk like the Modrinth ones.
+async fn pack_curseforge_ids(game_path: &Path, names: &HashSet<String>) -> HashSet<String> {
+    if !curseforge::available() { return HashSet::new(); }
+    let cache_path = launcher_data_dir().ok().map(|d| d.join("pack-curseforge.json"));
+    let mut cache: HashMap<String, String> = cache_path.as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mods_dir = game_path.join("mods");
+    let mut by_print: HashMap<u32, String> = HashMap::new();
+    for name in names.iter().filter(|n| n.to_lowercase().ends_with(".jar") && !cache.contains_key(*n)) {
+        if let Ok(bytes) = fs::read(mods_dir.join(name)) { by_print.insert(curseforge::fingerprint(&bytes), name.clone()); }
+    }
+    if !by_print.is_empty() {
+        if let Ok(client) = modrinth_client() {
+            let prints: Vec<u32> = by_print.keys().copied().collect();
+            if let Ok(found) = curseforge::match_fingerprints(&client, &prints).await {
+                for (print, name) in &by_print {
+                    cache.insert(name.clone(), found.get(print).map(|v| v.project_id.clone()).unwrap_or_default());
+                }
+                if let (Some(path), Ok(text)) = (cache_path.as_ref(), serde_json::to_string(&cache)) { let _ = fs::write(path, text); }
+            }
+        }
+    }
     names.iter().filter_map(|n| cache.get(n)).filter(|id| !id.is_empty()).cloned().collect()
 }
 
@@ -3206,7 +3279,7 @@ async fn pack_project_ids(game_path: &Path) -> HashSet<String> {
 static ADOPTION_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Projects by id (one request).
-async fn modrinth_projects(client: &reqwest::Client, ids: &[String]) -> Result<HashMap<String, serde_json::Value>, String> {
+async fn modrinth_only_projects(client: &reqwest::Client, ids: &[String]) -> Result<HashMap<String, serde_json::Value>, String> {
     if ids.is_empty() { return Ok(HashMap::new()); }
     let ids_text = serde_json::to_string(ids).map_err(|e| e.to_string())?;
     let projects: Vec<serde_json::Value> = client.get(format!("{MODRINTH_API}/projects"))
@@ -3218,6 +3291,14 @@ async fn modrinth_projects(client: &reqwest::Client, ids: &[String]) -> Result<H
     Ok(projects.into_iter()
         .filter_map(|p| p.get("id").and_then(|v| v.as_str()).map(str::to_string).map(|id| (id, p)))
         .collect())
+}
+
+/// Descriptions of mods from either site.
+async fn modrinth_projects(client: &reqwest::Client, ids: &[String]) -> Result<HashMap<String, serde_json::Value>, String> {
+    let (curse, modrinth): (Vec<String>, Vec<String>) = ids.iter().cloned().partition(|id| curseforge::is_curseforge(id));
+    let mut found = modrinth_only_projects(client, &modrinth).await?;
+    if !curse.is_empty() && curseforge::available() { found.extend(curseforge::projects(client, &curse).await?); }
+    Ok(found)
 }
 
 /// A mod the player put into `mods` by hand is looked up on Modrinth by the hash of the file. When it is a known
@@ -3254,6 +3335,20 @@ async fn adopt_manual_mods(game_path: &Path) {
             },
             Ok(r) => { eprintln!("[MODS] hash lookup refused: {}", r.status()); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
             Err(e) => { eprintln!("[MODS] hash lookup failed: {e}"); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
+        }
+    }
+    if curseforge::available() {
+        let mut by_print: HashMap<u32, String> = HashMap::new();
+        for (hash, name) in by_hash.iter().filter(|(hash, _)| !found.contains_key(*hash)) {
+            if let Ok(bytes) = fs::read(mods_dir.join(name)) { by_print.insert(curseforge::fingerprint(&bytes), hash.clone()); }
+        }
+        let prints: Vec<u32> = by_print.keys().copied().collect();
+        match curseforge::match_fingerprints(&client, &prints).await {
+            Ok(matches) => for (print, version) in matches {
+                if let Some(hash) = by_print.get(&print) { found.insert(hash.clone(), version); }
+            },
+            // Without an answer nothing may be removed as unknown.
+            Err(e) => { eprintln!("[MODS] CurseForge lookup failed: {e}"); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
         }
     }
     let mut wanted: Vec<String> = found.values().map(|v| v.project_id.clone()).collect();
@@ -3396,6 +3491,7 @@ fn main() {
             refresh_server_session,
             get_player_skin,
             modrinth_mod_versions,
+            curseforge_available,
             download_and_extract_modpack,
             check_and_update_modpack,
             check_launcher_update,
@@ -3470,6 +3566,13 @@ mod server_auth_tests {
         let jars = names.iter().filter(|n| n.starts_with("mods/") && n.ends_with(".jar")).count();
         assert_eq!(jars, 57, "mod jars in pack-2.6.0, names: {:?}", &names[..names.len().min(5)]);
         assert!(names.iter().any(|n| n == "manifest.json"));
+    }
+
+    #[test]
+    fn offline_uuid_matches_what_the_server_computes() {
+        assert_eq!(offline_uuid("Notch"), "b50ad385829d3141a2167e7d7539ba7f");
+        assert_eq!(offline_uuid("OgonickYT"), "91f785ecf4ce3186a58b678c30156a90");
+        assert_ne!(offline_uuid("a_b"), offline_uuid("A_b"), "the nickname is case sensitive for the server");
     }
 
     #[test]
@@ -3572,7 +3675,7 @@ mod server_auth_tests {
     fn players_never_see_blocked_mods() {
         let hit = |id: &str| ModrinthHit {
             project_id: id.into(), slug: id.into(), title: id.into(), description: String::new(), author: String::new(),
-            icon_url: None, downloads: 0, follows: 0, categories: vec![], client_side: "required".into(),
+            icon_url: None, downloads: 0, follows: 0, categories: vec![], client_side: "required".into(), website_url: None, downloadable: true,
             server_side: "unsupported".into(), date_modified: None,
         };
         let visible = hide_blocked(vec![hit("good"), hit("cheat"), hit("also-good")], &["cheat".to_string()]);

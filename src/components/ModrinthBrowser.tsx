@@ -30,6 +30,8 @@ interface ModrinthHit {
   clientSide?: string | null;
   serverSide?: string | null;
   dateModified?: string | null;
+  websiteUrl?: string | null;
+  downloadable?: boolean;
 }
 
 interface ModrinthSearchResponse {
@@ -47,6 +49,12 @@ interface ExtraModsState {
 }
 
 type SortIndex = 'relevance' | 'downloads' | 'newest';
+type Source = 'modrinth' | 'curseforge';
+
+const SITES: Record<Source, string> = {
+  modrinth: 'https://modrinth.com/discover/mods?v=1.21.1&g=categories:neoforge',
+  curseforge: 'https://www.curseforge.com/minecraft/search?class=mc-mods&version=1.21.1',
+};
 
 type Props = { t: T; gameDir: string; gameVersion: string; loader: string; username: string; askPassword: () => Promise<string | null>; forgetPassword: () => void };
 
@@ -91,6 +99,9 @@ function formatDownloads(count: number): string {
 
 export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, username, askPassword, forgetPassword }: Props) {
   const moderator = isModerator(username);
+  const [source, setSource] = useState<Source>('modrinth');
+  const [hasCurseForge, setHasCurseForge] = useState(false);
+  useEffect(() => { invoke<boolean>('curseforge_available').then(value => setHasCurseForge(value === true)).catch(() => undefined); }, []);
   const [query, setQuery] = useState('');
   const [submittedQuery, setSubmittedQuery] = useState('');
   const [categories, setCategories] = useState<string[]>([]);
@@ -146,6 +157,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         offset,
         limit: PAGE_SIZE,
         asModerator: moderator,
+        source,
       });
       // Players never get blocked mods from the backend; the moderator gets everything and sees the marks.
       const fresh = response.hits ?? [];
@@ -158,7 +170,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
       setLoading(false);
       setLoadingMore(false);
     }
-  }, [submittedQuery, gameVersion, loader, categories, sort, moderator]);
+  }, [submittedQuery, gameVersion, loader, categories, sort, moderator, source]);
 
   // Initial load and re-search whenever filters change.
   useEffect(() => { search(0, false); }, [search]);
@@ -222,12 +234,29 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         </div>
         <a
           className="mr-external"
-          href="https://modrinth.com/discover/mods?v=1.21.1&g=categories:neoforge"
-          onClick={event => { event.preventDefault(); invoke('open_external_url', { url: 'https://modrinth.com/discover/mods?v=1.21.1&g=categories:neoforge' }).catch(() => undefined); }}
+          href={SITES[source]}
+          onClick={event => { event.preventDefault(); invoke('open_external_url', { url: SITES[source] }).catch(() => undefined); }}
         >
-          {t('mrOpenModrinth')}
+          {source === 'curseforge' ? t('cfOpenSite') : t('mrOpenModrinth')}
         </a>
       </div>
+
+      {hasCurseForge && (
+        <div className="mr-sources" role="tablist">
+          {(['modrinth', 'curseforge'] as Source[]).map(name => (
+            <button
+              key={name}
+              type="button"
+              role="tab"
+              aria-selected={source === name}
+              className={`mr-chip ${source === name ? 'active' : ''}`}
+              onClick={() => { if (source !== name) { setHits([]); setCategories([]); setSource(name); } }}
+            >
+              {name === 'modrinth' ? 'Modrinth' : 'CurseForge'}
+            </button>
+          ))}
+        </div>
+      )}
 
       <form className="mr-search" onSubmit={submit}>
         <div className="mr-search-field">
@@ -253,7 +282,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         </label>
       </form>
 
-      <div className="mr-chips">
+      {source === 'modrinth' && <div className="mr-chips">
         {CATEGORIES.map(category => (
           <button
             key={category.id}
@@ -268,7 +297,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
         {categories.length > 0 && (
           <button type="button" className="mr-chip clear" onClick={() => setCategories([])}>{t('mrClearFilters')}</button>
         )}
-      </div>
+      </div>}
 
       {error && (
         <div className="mr-error">
@@ -330,7 +359,11 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                 )}
 
                 <div className="mr-card-actions">
-                  <button
+                  {hit.downloadable === false && !inPack && !isInstalled ? (
+                    <button className="mr-btn primary" title={t('cfForbiddenHint')} onClick={() => invoke('open_external_url', { url: hit.websiteUrl || SITES.curseforge }).catch(() => undefined)}>
+                      {t('cfOpenSite')}
+                    </button>
+                  ) : <button
                     className="mr-btn primary"
                     onClick={() => install(hit)}
                     disabled={isBusy || inPack}
@@ -338,7 +371,7 @@ export default function ModrinthBrowser({ t, gameDir, gameVersion, loader, usern
                   >
                     {isBusy ? <Loader2 size={14} className="spin" /> : inPack ? <Check size={14} /> : isInstalled ? <Repeat size={14} /> : <Download size={14} />}
                     {inPack ? t('mrInPack') : isInstalled ? t('userModsChange') : t('mrInstall')}
-                  </button>
+                  </button>}
                   {moderator && <button
                     className="mr-btn danger"
                     onClick={() => setBlockedState(hit.projectId, !blocked.has(hit.projectId), hit.title)}

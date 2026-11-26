@@ -333,3 +333,6 @@ footer{height:44px;display:flex;align-items:center;justify-content:space-between
 .play-button{background:linear-gradient(180deg,#ffdc5e,#ffc02e);color:#111;box-shadow:0 8px 22px #ffc02e30}
 .play-button:hover:not(:disabled){filter:brightness(1.07);box-shadow:0 10px 26px #ffc02e45}
 .pack-line b,.hero h1 em{color:#ffd54a}
+
+.mr-sources{display:flex;gap:8px;margin-bottom:12px}
+.mr-sources .mr-chip{padding:7px 16px;font-size:12px}
