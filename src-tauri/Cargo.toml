@@ -19,6 +19,7 @@ tar = "0.4"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "net"] }
 futures-util = "0.3"
 sha2 = "0.10"
+md5 = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 jsonwebtoken = "9"
 argon2 = { version = "0.5", features = ["std"] }
