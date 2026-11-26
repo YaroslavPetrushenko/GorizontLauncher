@@ -3347,6 +3347,8 @@ async fn adopt_manual_mods(game_path: &Path) {
             Ok(matches) => for (print, version) in matches {
                 if let Some(hash) = by_print.get(&print) { found.insert(hash.clone(), version); }
             },
+            // A refused key will not start working by waiting: the check goes on with Modrinth alone.
+            Err(e) if e == curseforge::KEY_REFUSED => eprintln!("[MODS] {e}"),
             // Without an answer nothing may be removed as unknown.
             Err(e) => { eprintln!("[MODS] CurseForge lookup failed: {e}"); ADOPTION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst); return; }
         }

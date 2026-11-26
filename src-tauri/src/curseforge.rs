@@ -7,6 +7,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 const API: &str = "https://api.curseforge.com/v1";
+/// A refused key is permanent for this build: CurseForge is then treated as absent where the launcher must not
+/// depend on it (recognising hand-placed jars).
+pub const KEY_REFUSED: &str = "CurseForge не принял ключ лаунчера";
 const MINECRAFT: u32 = 432;
 const MODS_CLASS: u32 = 6;
 const NEOFORGE: u32 = 6;
@@ -33,7 +36,7 @@ async fn send(request: reqwest::RequestBuilder) -> Result<Value, String> {
     let response = request.header("x-api-key", key).header("Accept", "application/json").send().await
         .map_err(|e| format!("CurseForge недоступен: {e}"))?;
     let status = response.status();
-    if status.as_u16() == 401 || status.as_u16() == 403 { return Err("CurseForge не принял ключ лаунчера".into()); }
+    if status.as_u16() == 401 || status.as_u16() == 403 { return Err(KEY_REFUSED.into()); }
     if !status.is_success() { return Err(format!("CurseForge вернул ошибку: {status}")); }
     response.json().await.map_err(|e| format!("Не удалось разобрать ответ CurseForge: {e}"))
 }
