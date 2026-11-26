@@ -1,0 +1,21 @@
+name: CurseForge check
+on:
+  push:
+    branches: [ci/curseforge-check]
+jobs:
+  live:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - name: Live CurseForge test
+        working-directory: src-tauri
+        env:
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        run: cargo test curseforge_live -- --ignored --nocapture
