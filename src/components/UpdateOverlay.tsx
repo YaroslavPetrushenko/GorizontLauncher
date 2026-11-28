@@ -21,7 +21,7 @@ export default function UpdateOverlay({ t, progress, onClose }: Props) {
       <p className="update-description">{done ? t('ovDoneDesc') : downloading ? t('ovDownloadingDesc') : t('ovWaitDesc')}</p>
       <div className="update-progress-meta"><span>{progress.stage}</span><strong>{Math.round(percent)}%</strong></div>
       <div className="update-progress-track"><div className="update-progress-fill" style={{ width: `${percent}%` }} /><div className="update-progress-shine" /></div>
-      <div className="update-stats"><span><b>{progress.total ? `${(progress.downloaded / 1024 / 1024).toFixed(1)} MB` : t('ovConnecting')}</b><small>{t('ovDownloaded')}</small></span>{progress.speed ? <span><b>{formatSpeed(progress.speed)}</b><small>{t('ovSpeed')}</small></span> : null}<span><b>{done ? t('ovInstalled') : unpacking ? t('ovUnzip') : t('ovUpdating')}</b><small>{t('ovStatus')}</small></span></div>
+      <div className="update-stats"><span><b>{progress.total ? `${(progress.downloaded / 1024 / 1024).toFixed(1)} MB` : t('ovConnecting')}</b><small>{t('ovDownloaded')}</small></span><span><b>{progress.speed ? formatSpeed(progress.speed) : '—'}</b><small>{t('ovSpeed')}</small></span><span><b>{done ? t('ovInstalled') : unpacking ? t('ovUnzip') : t('ovUpdating')}</b><small>{t('ovStatus')}</small></span></div>
       <div className="update-dots"><i /><i /><i /></div>
     </div>
   </div>;
