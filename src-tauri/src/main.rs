@@ -1772,6 +1772,7 @@ async fn prepare_game_files(app: AppHandle, game_dir: String, version_override: 
     // Extras (neither pack mods nor the player's downloads) are removed before the game starts.
     ensure_pack_mods_list(&game_path).await;
     adopt_manual_mods(&game_path).await;
+    drop_pack_duplicates(&game_path).await;
     quarantine_unknown_mods(&game_path);
 
     if !version_id.is_empty() { ensure_loader(&app, &game_path, &loader).await?; }
@@ -1795,6 +1796,7 @@ async fn launch_minecraft(app: AppHandle, username: String, ram_mb: u32, game_di
 
     // A mod dropped in after the preparation is checked on Modrinth too; what is not accepted is removed.
     adopt_manual_mods(&game_path).await;
+    drop_pack_duplicates(&game_path).await;
     quarantine_unknown_mods(&game_path);
 
     // --- Java detection: version + architecture ---
@@ -2141,6 +2143,7 @@ async fn scan_user_mods_cmd(game_dir: String) -> Result<UserModsManifest, String
     ensure_pack_mods_list(&game_path).await;
     let _ = refresh_moderation().await;
     adopt_manual_mods(&game_path).await;
+    drop_pack_duplicates(&game_path).await;
     scan_user_mods(&game_path)
 }
 
@@ -3247,6 +3250,45 @@ async fn pack_project_ids(game_path: &Path) -> HashSet<String> {
     projects
 }
 
+/// A mod the player downloaded that the pack now ships itself would be loaded twice (and often in a version the
+/// pack does not work with): the player's copy is moved to `mods-old` and forgotten. The pack's own file is never
+/// touched. Returns the names moved.
+fn retire_pack_duplicates(game_path: &Path, state: &mut ModrinthState, pack_files: &HashSet<String>, pack_projects: &HashSet<String>) -> Vec<String> {
+    let duplicates: Vec<(String, String)> = state.installed.iter()
+        .filter(|(id, installed)| pack_projects.contains(*id) && !pack_files.contains(&installed.filename))
+        .map(|(id, installed)| (id.clone(), installed.filename.clone()))
+        .collect();
+    let old_dir = game_path.join("mods-old");
+    let mut moved = Vec::new();
+    for (id, filename) in duplicates {
+        let mut stuck = false;
+        for folder in ["mods", "mods-disabled"] {
+            let path = game_path.join(folder).join(&filename);
+            if !path.is_file() { continue; }
+            let _ = fs::create_dir_all(&old_dir);
+            let target = old_dir.join(&filename);
+            let _ = fs::remove_file(&target);
+            match move_file(&path, &target) {
+                Ok(()) => { eprintln!("[MODS] {filename} is already in the modpack, the downloaded copy is moved to mods-old"); moved.push(filename.clone()); }
+                Err(e) => { eprintln!("[MODS] could not move the duplicate {filename}: {e}"); stuck = true; }
+            }
+        }
+        // A file that could not be moved stays on record, so the next start tries again.
+        if !stuck { state.installed.remove(&id); }
+    }
+    moved
+}
+
+async fn drop_pack_duplicates(game_path: &Path) {
+    if read_pack_mod_list(game_path).is_none() || load_modrinth_state().installed.is_empty() { return; }
+    let projects = pack_project_ids(game_path).await;
+    // Read again: the lookup takes a while.
+    let mut state = load_modrinth_state();
+    let before = state.installed.len();
+    retire_pack_duplicates(game_path, &mut state, &pack_mod_filenames(game_path), &projects);
+    if state.installed.len() != before { let _ = save_modrinth_state(&state); }
+}
+
 /// The CurseForge projects of the pack's jars, by fingerprint, remembered on disk like the Modrinth ones.
 async fn pack_curseforge_ids(game_path: &Path, names: &HashSet<String>) -> HashSet<String> {
     if !curseforge::available() { return HashSet::new(); }
@@ -3534,6 +3576,32 @@ fn main() {
 
 #[cfg(test)]
 mod server_auth_tests {
+    #[test]
+    fn a_downloaded_copy_of_a_pack_mod_is_set_aside() {
+        let game = std::env::temp_dir().join(format!("gorizont-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&game);
+        std::fs::create_dir_all(game.join("mods")).unwrap();
+        for name in ["sodium-pack.jar", "sodium-mine.jar", "map.jar"] {
+            std::fs::write(game.join("mods").join(name), name).unwrap();
+        }
+        let mut state = super::ModrinthState::default();
+        let record = |filename: &str| super::InstalledProject { filename: filename.into(), ..Default::default() };
+        state.installed.insert("sodium".into(), record("sodium-mine.jar"));
+        state.installed.insert("map".into(), record("map.jar"));
+        let pack_files = ["sodium-pack.jar".to_string()].into_iter().collect();
+        let pack_projects = ["sodium".to_string()].into_iter().collect();
+
+        let moved = super::retire_pack_duplicates(&game, &mut state, &pack_files, &pack_projects);
+
+        assert_eq!(moved, vec!["sodium-mine.jar".to_string()]);
+        assert!(game.join("mods/sodium-pack.jar").exists());
+        assert!(game.join("mods/map.jar").exists());
+        assert!(game.join("mods-old/sodium-mine.jar").exists());
+        assert!(!state.installed.contains_key("sodium"));
+        assert!(state.installed.contains_key("map"));
+        let _ = std::fs::remove_dir_all(&game);
+    }
+
     use super::*;
 
     #[test]

@@ -34,7 +34,7 @@ export default function App() {
   const [status, setStatus] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [version, setVersion] = useState('1.4.5');
+  const [version, setVersion] = useState('1.4.6');
   const [memory, setMemory] = useState<SystemMemory | null>(null);
   const gameRunning = useRef(false);
   const busyRef = useRef(false);
@@ -64,11 +64,17 @@ export default function App() {
         try {
           const response = await tryAutoLogin();
           if (response && !cancelled) {
-            setAccount({
+            // The refreshed launcher tokens say nothing about the game server: its token is only in the
+            // saved profile and must be carried over, otherwise pressing Play signs the player out.
+            const saved = legacyAccount?.username === response.user.nickname ? legacyAccount : null;
+            const next: Account = {
+              ...saved,
               username: response.user.nickname,
               uuid: response.user.id,
               passHash: response.access_token,
-            });
+            };
+            saveAccount(next);
+            setAccount(next);
           }
         } catch (e) {
           // Auto-login failed, will show auth screen
