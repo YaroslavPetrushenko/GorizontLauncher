@@ -21,7 +21,8 @@ try {
     minecraft_version = '1.21.1'
     loader = [ordered]@{ type = 'neoforge'; version = $LoaderVersion }
   }
-  $manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $temp 'manifest.json') -Encoding UTF8
+  # Without a BOM: Windows PowerShell's "-Encoding UTF8" adds one and the launcher cannot read such a file.
+  [IO.File]::WriteAllText((Join-Path $temp 'manifest.json'), ($manifest | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
   if (Test-Path $Output) { Remove-Item $Output -Force }
   Compress-Archive -Path (Join-Path $temp '*') -DestinationPath $Output -CompressionLevel Optimal
   Write-Host "Created $Output"
