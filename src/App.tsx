@@ -58,9 +58,9 @@ export default function App() {
         if (!cancelled) setAccount(legacyAccount);
       }
       
-      // Then try auto-login with stored tokens
+      // Then try auto-login with stored tokens. It must not touch "busy": the pack may already be downloading,
+      // and clearing the flag would enable Play and start a second update.
       if (!cancelled) {
-        setBusy(true);
         try {
           const response = await tryAutoLogin();
           if (response && !cancelled) {
@@ -80,7 +80,6 @@ export default function App() {
           // Auto-login failed, will show auth screen
         } finally {
           if (!cancelled) {
-            setBusy(false);
             setAuthChecked(true);
           }
         }
@@ -106,8 +105,15 @@ export default function App() {
   const persistSettings = (next: Settings) => { setSettings(next); try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch { /* ignore */ } };
   const logout = () => { clearAccount(); clearAuth(); setAccount(null); setShowSettings(false); setStatus(null); };
 
+  // Whoever asks while an update is running (Play, the periodic check) joins it instead of starting another.
+  const preparing = useRef<Promise<boolean> | null>(null);
+  const prepare = (): Promise<boolean> => {
+    preparing.current ??= runPrepare().finally(() => { preparing.current = null; });
+    return preparing.current;
+  };
+
   // Checks the modpack release, installs/updates it and downloads missing libraries and assets.
-  const prepare = async (): Promise<boolean> => {
+  const runPrepare = async (): Promise<boolean> => {
     setStatus(t('checkingUpdates'));
     try {
       const installedVersion = await invoke<string>('check_and_update_modpack', { localVersion: settings.localVersion, targetDir: settings.gameDir });

@@ -1003,25 +1003,86 @@ fn safe_extract<R: io::Read + io::Seek>(archive: &mut ZipArchive<R>, target: &Pa
     Ok(manifest)
 }
 
+/// Where the unfinished download of this pack file is kept. The address contains the release tag, so a newer
+/// pack gets its own file and a part of an old one is never continued with new bytes.
+fn pack_part_path(game_path: &Path, url: &str) -> PathBuf {
+    let name = format!("{:x}", Sha256::digest(url.as_bytes()));
+    game_path.join(".gorizont-download").join(format!("{}.part", &name[..32]))
+}
+
+/// Downloads `url` into `part`, continuing after the bytes that are already there. Whatever arrived stays on disk
+/// when the connection or the launcher is lost, so the next attempt asks only for the rest.
+async fn download_resumable(url: &str, part: &Path, mut progress: impl FnMut(u64, Option<u64>)) -> Result<(), String> {
+    use std::time::Duration;
+    const STALL: Duration = Duration::from_secs(60);
+    if let Some(folder) = part.parent() {
+        fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+        // Parts of other packs will never be continued.
+        if let Ok(entries) = fs::read_dir(folder) {
+            for entry in entries.flatten() {
+                if entry.path() != part { let _ = fs::remove_file(entry.path()); }
+            }
+        }
+    }
+    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
+    let lost = |e: &dyn std::fmt::Display| format!("Скачивание прервано ({e}). Нажмите «Играть»: загрузка продолжится с того же места.");
+    for _ in 0..2 {
+        let have = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+        let mut request = client.get(url).header("User-Agent", "GorizontLauncher/1.0");
+        if have > 0 { request = request.header("Range", format!("bytes={have}-")); }
+        let response = tokio::time::timeout(STALL, request.send()).await.map_err(|_| lost(&"сервер не отвечает"))?.map_err(|e| lost(&e))?;
+        let status = response.status().as_u16();
+        let range = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let range_total: Option<u64> = range.rsplit('/').next().and_then(|v| v.parse().ok());
+        if status == 416 {
+            // Nothing is left to ask for: either the file is complete or the part does not belong to it.
+            if range_total == Some(have) { return Ok(()); }
+            let _ = fs::remove_file(part);
+            continue;
+        }
+        if !response.status().is_success() { return Err(format!("Не удалось скачать сборку: сервер ответил {}", response.status())); }
+        let resumed = status == 206 && range.starts_with(&format!("bytes {have}-"));
+        if status == 206 && !resumed { let _ = fs::remove_file(part); continue; }
+        let total = if resumed { range_total } else { response.content_length() };
+        let mut downloaded = if resumed { have } else { 0 };
+        let mut file = fs::OpenOptions::new().create(true).write(true).append(resumed).truncate(!resumed).open(part).map_err(|e| e.to_string())?;
+        progress(downloaded, total);
+        let mut stream = response.bytes_stream();
+        loop {
+            let next = tokio::time::timeout(STALL, stream.next()).await.map_err(|_| lost(&"нет данных больше минуты"))?;
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|e| lost(&e))?;
+            file.write_all(&chunk).map_err(|e| format!("Не удалось записать сборку на диск: {e}"))?;
+            downloaded += chunk.len() as u64;
+            progress(downloaded, total);
+        }
+        if total.is_some_and(|t| downloaded < t) { return Err(lost(&"получен не весь файл")); }
+        return Ok(());
+    }
+    Err("Не удалось продолжить скачивание сборки, попробуйте ещё раз".into())
+}
+
+/// Only one pack check or installation runs at a time; a second request waits and then sees its result.
+static PACK_UPDATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tauri::command]
 async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: String, expected_sha256: Option<String>, signature_url: Option<String>) -> Result<(), String> {
     eprintln!("[DEBUG] download_and_extract_modpack called: url={}, target_dir={}", url, target_dir);
     let target = expand_windows_path(&target_dir); fs::create_dir_all(&target).map_err(|e| e.to_string())?; let config = launcher_config()?;
-    
-    // Backup approved user mods before extracting new modpack
-    let approved_mods = backup_approved_user_mods(&target).unwrap_or_default();
-    
-    let response = reqwest::Client::new().get(&url).header("User-Agent", "GorizontLauncher/0.1").send().await.map_err(|e| e.to_string())?;
-    let total = response.content_length(); let mut downloaded = 0; let mut bytes = Vec::new(); let mut stream = response.bytes_stream();
-    emit_progress(&app, "Скачивание модов...", 0, total);
-    while let Some(chunk) = stream.next().await { let chunk = chunk.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; bytes.extend_from_slice(&chunk); emit_progress(&app, "Скачивание модов...", downloaded, total); }
-    if let Some(expected) = expected_sha256 { let actual = format!("{:x}", Sha256::digest(&bytes)); if actual.to_lowercase() != expected.to_lowercase() { return Err("Проверка SHA-256 не пройдена".into()); } }
-    // Modpacks are installed only when their signature is valid.
+
+    let part = pack_part_path(&target, &url);
+    download_resumable(&url, &part, |done, total| emit_progress(&app, "Скачивание модов...", done, total)).await?;
+    let bytes = fs::read(&part).map_err(|e| e.to_string())?;
+    if let Some(expected) = expected_sha256 { let actual = format!("{:x}", Sha256::digest(&bytes)); if actual.to_lowercase() != expected.to_lowercase() { let _ = fs::remove_file(&part); return Err("Проверка SHA-256 не пройдена".into()); } }
+// Modpacks are installed only when their signature is valid.
     let signature_url = signature_url.ok_or_else(|| "В релизе нет подписи modpack.sig: сборка не будет установлена".to_string())?;
     let signature = reqwest::Client::new().get(&signature_url).header("User-Agent", "GorizontLauncher/1.0").send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("Не удалось скачать подпись: {e}"))?.text().await.map_err(|e| e.to_string())?;
-    verify_modpack_signature(&bytes, &signature)?;
+    // A damaged file must not be continued next time, so it is thrown away.
+    if let Err(e) = verify_modpack_signature(&bytes, &signature) { let _ = fs::remove_file(&part); return Err(e); }
+    // The player's own mods are set aside only now, when the new pack is complete and trusted.
+    let approved_mods = backup_approved_user_mods(&target).unwrap_or_default();
     emit_progress(&app, "Распаковка модов...", 0, Some(bytes.len() as u64));
-    let cursor = io::Cursor::new(bytes); let mut archive = ZipArchive::new(cursor).map_err(|e| e.to_string())?; let manifest = safe_extract(&mut archive, &target, &config)?;
+let cursor = io::Cursor::new(bytes); let mut archive = ZipArchive::new(cursor).map_err(|e| e.to_string())?; let manifest = safe_extract(&mut archive, &target, &config)?;
     
     // Restore approved user mods after extracting new modpack
     if !approved_mods.is_empty() {
@@ -1030,7 +1091,8 @@ async fn download_and_extract_modpack(app: AppHandle, url: String, target_dir: S
     }
     
     fs::write(target.join(".gorizont-installed.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    
+    let _ = fs::remove_file(&part);
+
     emit_progress(&app, "Готово", 1, Some(1)); Ok(())
 }
 
@@ -1155,7 +1217,8 @@ async fn latest_pack_version(config: &LauncherConfig) -> Result<Option<String>, 
 
 #[tauri::command]
 async fn check_and_update_modpack(app: AppHandle, local_version: String, target_dir: String, version_override: Option<String>) -> Result<String, String> {
-    let log_file = std::env::temp_dir().join("gorizont_launcher.log");
+    let _one_at_a_time = PACK_UPDATE.lock().await;
+let log_file = std::env::temp_dir().join("gorizont_launcher.log");
     let log = |msg: &str| {
         let _ = fs::OpenOptions::new().create(true).append(true).open(&log_file).and_then(|mut f| f.write_all(format!("[{}] {}\n", chrono::Local::now().format("%H:%M:%S%.3f"), msg).as_bytes()));
     };
@@ -3619,6 +3682,59 @@ fn main() {
 
 #[cfg(test)]
 mod server_auth_tests {
+    #[tokio::test]
+    async fn an_interrupted_pack_download_continues_where_it_stopped() {
+        use std::io::{Read, Write};
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/pack-9/modpack.zip", listener.local_addr().unwrap());
+        let served = data.clone();
+        let server = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 4096];
+                let n = socket.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..n]).to_lowercase();
+                let from: Option<usize> = request.split("range: bytes=").nth(1).and_then(|r| r.split('-').next()).and_then(|v| v.parse().ok());
+                asked.push(from);
+                let len = served.len();
+                match (attempt, from) {
+                    // The first connection breaks after 70 000 bytes.
+                    (0, _) => {
+                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n").unwrap();
+                        socket.write_all(&served[..70_000]).unwrap();
+                    }
+                    (_, Some(from)) if from < len => {
+                        write!(socket, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{len}\r\nConnection: close\r\n\r\n", len - from, len - 1).unwrap();
+                        socket.write_all(&served[from..]).unwrap();
+                    }
+                    _ => write!(socket, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */{len}\r\nConnection: close\r\n\r\n").unwrap(),
+                }
+            }
+            asked
+        });
+        let game = std::env::temp_dir().join(format!("gorizont-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&game);
+        let part = super::pack_part_path(&game, &url);
+
+        assert!(super::download_resumable(&url, &part, |_, _| {}).await.is_err());
+        let kept = std::fs::metadata(&part).unwrap().len() as usize;
+        assert!(kept > 0 && kept <= 70_000);
+
+        let mut first_report = None;
+        super::download_resumable(&url, &part, |done, _| { first_report.get_or_insert(done); }).await.unwrap();
+        assert_eq!(first_report, Some(kept as u64));
+        assert_eq!(std::fs::read(&part).unwrap(), data);
+
+        // The launcher closed after the last byte: the complete file is accepted as it is.
+        super::download_resumable(&url, &part, |_, _| {}).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), data);
+        assert_eq!(server.join().unwrap(), vec![None, Some(kept), Some(data.len())]);
+        assert_ne!(part, super::pack_part_path(&game, "http://x/pack-10/modpack.zip"));
+        let _ = std::fs::remove_dir_all(&game);
+    }
+
     /// Live check against GitHub: cargo test -- --ignored
     #[tokio::test]
     #[ignore]
