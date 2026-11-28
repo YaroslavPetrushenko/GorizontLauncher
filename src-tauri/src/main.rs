@@ -576,7 +576,7 @@ async fn ensure_pack_mods_list(game_path: &Path) {
     let Ok(text) = fs::read_to_string(game_path.join(".gorizont-installed.json")) else { return };
     let Ok(installed) = serde_json::from_str::<PackManifest>(&text) else { return };
     let Ok(config) = launcher_config() else { return };
-    let Ok(releases_text) = fetch_releases_text(&config).await else { return };
+    let Ok(releases_text) = pack_releases_text(&config).await else { return };
     let Ok(releases) = serde_json::from_str::<Vec<Release>>(&releases_text) else { return };
     let wanted = installed.pack_version.trim_start_matches('v').to_string();
     let release = releases.iter().filter(|r| !r.draft)
@@ -833,6 +833,49 @@ async fn fetch_releases_text(config: &LauncherConfig) -> Result<String, String> 
     let body = response.text().await.map_err(|e| format!("чтение ответа: {e}"))?;
     if let Ok(mut cache) = RELEASES_CACHE.lock() { cache.etag = new_etag; cache.body = Some(body.clone()); cache.fetched = Some(std::time::Instant::now()); }
     Ok(body)
+}
+
+/// Pack releases read from the public releases feed. It needs no API call, so the API's request limit does not
+/// affect it. Only the newest releases are in the feed; the result is shaped like the API answer, newest pack first.
+fn pack_releases_from_feed(feed: &str, owner: &str, repo: &str, asset_name: &str) -> String {
+    let marker = format!("https://github.com/{owner}/{repo}/releases/tag/");
+    let mut tags: Vec<String> = feed.split(&marker).skip(1)
+        .filter_map(|part| part.split('"').next())
+        .filter(|tag| tag.strip_prefix("pack-").is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.')))
+        .map(str::to_string)
+        .collect();
+    let version = |tag: &str| tag.trim_start_matches("pack-").to_string();
+    tags.sort_by(|a, b| if version_newer(&version(a), &version(b)) { std::cmp::Ordering::Less } else if version_newer(&version(b), &version(a)) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal });
+    tags.dedup();
+    let releases: Vec<serde_json::Value> = tags.iter().map(|tag| {
+        let base = format!("https://github.com/{owner}/{repo}/releases/download/{tag}");
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": false,
+            "assets": [
+                { "name": asset_name, "browser_download_url": format!("{base}/{asset_name}") },
+                { "name": "modpack.sig", "browser_download_url": format!("{base}/modpack.sig") }
+            ]
+        })
+    }).collect();
+    serde_json::Value::Array(releases).to_string()
+}
+
+/// The releases used to find the modpack: the API answer, or the public feed when the API refuses.
+async fn pack_releases_text(config: &LauncherConfig) -> Result<String, String> {
+    let api_error = match fetch_releases_text(config).await {
+        Ok(body) => return Ok(body),
+        Err(e) => e,
+    };
+    let url = format!("https://github.com/{}/{}/releases.atom", config.github_owner, config.github_repo);
+    let feed = async {
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
+        client.get(url).header("User-Agent", "GorizontLauncher/1.0").send().await?.error_for_status()?.text().await
+    }.await.map_err(|e: reqwest::Error| format!("{api_error}; лента релизов: {e}"))?;
+    let releases = pack_releases_from_feed(&feed, &config.github_owner, &config.github_repo, &config.modpack_asset);
+    if releases == "[]" { return Err(format!("{api_error}; в ленте релизов нет сборки")); }
+    eprintln!("[PACK] API unavailable ({api_error}), the releases feed is used");
+    Ok(releases)
 }
 
 /// Release list for the news panel (same cached request as the updater).
@@ -1105,7 +1148,7 @@ async fn ensure_java(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Latest published modpack version on GitHub (None when offline or no release has the pack asset).
 async fn latest_pack_version(config: &LauncherConfig) -> Result<Option<String>, String> {
-    let releases_text = fetch_releases_text(config).await?;
+    let releases_text = pack_releases_text(config).await?;
     let releases = serde_json::from_str::<Vec<Release>>(&releases_text).map_err(|e| format!("разбор ответа: {e}"))?;
     Ok(releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == config.modpack_asset)).map(|release| release.tag_name.trim_start_matches('v').trim_start_matches("pack-").to_string()))
 }
@@ -1365,7 +1408,7 @@ async fn check_and_update_modpack(app: AppHandle, local_version: String, target_
     }
     
     // THIRD: Fallback to GitHub releases (only if no local modpack configured)
-    if let Ok(releases_text) = fetch_releases_text(&effective_config).await {
+    if let Ok(releases_text) = pack_releases_text(&effective_config).await {
         {
             if let Ok(releases) = serde_json::from_str::<Vec<Release>>(&releases_text) {
                 if let Some(release) = releases.into_iter().find(|r| r.assets.iter().any(|a| a.name == effective_config.modpack_asset)) {
@@ -3576,6 +3619,32 @@ fn main() {
 
 #[cfg(test)]
 mod server_auth_tests {
+    /// Live check against GitHub: cargo test -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn the_real_releases_feed_names_a_downloadable_pack() {
+        let feed = reqwest::Client::new().get("https://github.com/YaroslavPetrushenko/GorizontLauncher/releases.atom")
+            .header("User-Agent", "GorizontLauncher/1.0").send().await.unwrap().text().await.unwrap();
+        let releases = super::pack_releases_from_feed(&feed, "YaroslavPetrushenko", "GorizontLauncher", "modpack.zip");
+        let list: Vec<serde_json::Value> = serde_json::from_str(&releases).unwrap();
+        println!("newest pack in the feed: {}", list[0]["tag_name"]);
+        let signature = list[0]["assets"][1]["browser_download_url"].as_str().unwrap();
+        assert!(reqwest::get(signature).await.unwrap().status().is_success());
+    }
+
+    #[test]
+    fn pack_is_found_in_the_releases_feed() {
+        let entry = |tag: &str| format!("<link href=\"https://github.com/o/r/releases/tag/{tag}\"/>");
+        let feed = [entry("launcher-v1.4.6"), entry("pack-2.6.0"), entry("pack-3.1.0"), entry("pack-3.1.0-draft")].concat();
+        let releases = super::pack_releases_from_feed(&feed, "o", "r", "modpack.zip");
+        let list: Vec<serde_json::Value> = serde_json::from_str(&releases).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["tag_name"], "pack-3.1.0");
+        assert_eq!(list[0]["assets"][0]["browser_download_url"], "https://github.com/o/r/releases/download/pack-3.1.0/modpack.zip");
+        assert_eq!(list[0]["assets"][1]["name"], "modpack.sig");
+        assert_eq!(super::pack_releases_from_feed("<feed/>", "o", "r", "modpack.zip"), "[]");
+    }
+
     #[test]
     fn a_downloaded_copy_of_a_pack_mod_is_set_aside() {
         let game = std::env::temp_dir().join(format!("gorizont-dup-{}", std::process::id()));
